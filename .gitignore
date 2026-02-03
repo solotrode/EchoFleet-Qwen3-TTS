@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+.pip-cache/
+
+# Test/analysis
+.pytest_cache/
+.mypy_cache/
+.cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Env files
+.env
+.env.local
+
+# Logs and outputs
+*.log
+logs/
+outputs/
+
+# Archives and local artifacts
+ARCHIVE/
+
+# Docker artifacts
+*.tar
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,82 @@
+# ============================================================================
+# Qwen3-TTS Requirements
+# Compatible with CUDA 12.8, Python 3.12, PyTorch 2.7.0 (cu128)
+# ============================================================================
+
+# Build dependencies (install first)
+packaging>=23.0
+wheel>=0.40.0
+setuptools>=68.0.0
+ninja>=1.11.0
+
+# Core Deep Learning (PyTorch installed separately in Dockerfile)
+# torch==2.7.0+cu128 (installed via --index-url https://download.pytorch.org/whl/cu128)
+# torchvision==0.22.0+cu128
+# torchaudio==2.7.0+cu128
+# xformers==0.0.30+cu128
+
+# Qwen3-TTS Core Dependencies (from pyproject.toml, excluding torch ecosystem)
+transformers==4.57.3
+accelerate==1.12.0
+librosa
+soundfile
+einops
+onnxruntime
+sox
+
+# Gradio for demo (optional but included)
+gradio
+
+# Audio Processing
+pydub>=0.25.0
+audioread>=3.0.0
+resampy>=0.4.0
+sox>=1.4.0
+ffmpeg-python>=0.2.0
+
+# API Framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+python-multipart>=0.0.6
+
+# Utilities
+numpy>=1.24.0
+scipy>=1.11.0
+aiofiles>=23.0.0
+tenacity>=8.2.0
+langdetect>=1.0.9
+
+# Monitoring
+prometheus-client>=0.18.0
+psutil>=5.9.0
+
+# ============================================================================
+# Multi-GPU Queue Processing
+# ============================================================================
+
+# Redis queue for async job processing
+redis>=5.0.1
+rq>=1.15.1
+
+# Whisper for transcription and accuracy scoring
+# Use HuggingFace/Transformers Whisper instead of the `openai-whisper` package.
+# Reason: `openai-whisper` pins `triton<3`, which conflicts with PyTorch 2.7 (Linux uses triton==3.x).
+# Model repo: https://huggingface.co/openai/whisper-large-v3-turbo
+torchcodec>=0.3.0
+jiwer==3.0.3
+whisper-normalizer==0.1.12
+
+# Scheduling (for cleanup tasks)
+apscheduler==3.10.4
+
+
+# Development Dependencies (optional, for development only)
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
+httpx>=0.25.0
+black>=23.0.0
+isort>=5.12.0
+mypy>=1.5.0
+flake8>=6.1.0

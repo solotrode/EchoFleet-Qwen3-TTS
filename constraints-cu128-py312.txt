@@ -1,0 +1,13 @@
+# Pinned torch stack for CUDA 12.8 (cu128) + Python 3.12.
+#
+# Purpose:
+# - Prevent dependency resolution (e.g., openai-whisper, editable Qwen3-TTS) from
+#   downgrading torch/vision/audio to older CUDA builds (e.g., cu121).
+# - Allow fully offline installs when used with: pip --no-index --find-links
+#
+# NOTE: We intentionally pin only the torch stack here. NVIDIA runtime wheels
+# will be resolved from the local wheelhouse.
+
+# Upgrade to the desired PyTorch release for better compatibility with
+# prebuilt acceleration wheels (flash-attn). Set to PyTorch 2.10 for cu128.
+torch==2.10.0+cu128

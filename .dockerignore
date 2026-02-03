@@ -1,0 +1,31 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+.pip-cache/
+.pytest_cache/
+.mypy_cache/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.git/
+.gitignore
+.gitattributes
+.env
+.env.local
+*.log
+ARCHIVE/
+logs/
+outputs/
+
+# Only bake the actual model payloads under models/Qwen.
+# The other cache directories (models/hub, models/transformers, models/xet, etc.)
+# can contain link-like entries and very deep paths that break Docker Desktop builds.
+models/**
+!models/Qwen/**

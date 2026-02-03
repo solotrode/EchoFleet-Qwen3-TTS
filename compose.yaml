@@ -1,0 +1,177 @@
+services:
+  # ============================================================================
+  # Redis - Job queue and state management
+  # ============================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: echofleet-qwen3-redis
+    restart: unless-stopped
+    # Do NOT expose Redis on the host to avoid colliding with a host Redis instance.
+    # Keep Redis accessible only on the Docker network at port 6379.
+    volumes:
+      - redis_data:/data
+    command: ["sh", "-c", "redis-server --appendonly yes --tcp-keepalive 60"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - echofleet-qwen3-network
+
+  # ============================================================================
+  # Qwen3-TTS API Server
+  # ============================================================================
+  echofleet-qwen3-tts:
+    image: echofleet-qwen3-tts:local
+    env_file:
+      - .env
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        MAX_JOBS: 1
+    container_name: echofleet-qwen3-tts
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MODEL_CACHE_DIR=/models
+      - OUTPUT_DIR=/workspace/outputs
+      - TTS_GPUS=0,1,2,3
+      - TTS_PREFERRED_GPU=0
+      - TTS_GPU_CAPACITY=1
+      # Disable in-process workers; use the dedicated `qwen3-worker` container.
+      - TTS_WORKER_CONCURRENCY=0
+      - WHISPER_DEVICE_POOL=0,1,2,3
+      - LOG_LEVEL=INFO
+      - STRUCTURED_LOGGING=true
+      - LOG_TO_FILE=true
+      - LOG_FILE_PATH=/logs/echofleet-qwen3-tts.jsonl
+      - LOG_RETENTION_DAYS=10
+      - JOB_ARTIFACT_RETENTION_DAYS=10
+      - MAX_REQUEST_SIZE=26214400  # 25 MB
+    ports:
+      - "18000:8000"  # API server
+    volumes:
+      - ./outputs:/workspace/outputs
+      - ./logs:/logs
+      - ./voices:/voices:ro
+      - ./scripts:/app/scripts:ro
+      - ./api:/app/api:ro
+      - ./utils:/app/utils:ro
+      - ./config:/app/config:ro
+      - ./inference:/app/inference:ro
+      - qwen3_tts_models:/models:ro
+      - stt_models:/stt_models:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    networks:
+      - echofleet-qwen3-network
+
+  # ============================================================================
+  # RQ Worker - Background job processing
+  # ============================================================================
+  echofleet-qwen3-worker:
+    image: echofleet-qwen3-tts:local
+    container_name: echofleet-qwen3-worker
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Dedicated worker process for the Redis list `tts:jobs`.
+    # We avoid RQ here because its pubsub subscribe connection can be dropped
+    # while idle in some Docker Desktop/Windows networking setups.
+    command: ["python", "-m", "worker.run"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - MODEL_CACHE_DIR=/models
+      - OUTPUT_DIR=/workspace/outputs
+      - TTS_GPUS=0,1,2,3
+      - TTS_PREFERRED_GPU=0
+      - TTS_GPU_CAPACITY=1
+      - TTS_WORKER_CONCURRENCY=4
+      - WHISPER_DEVICE_POOL=0,1,2,3
+      - LOG_LEVEL=INFO
+      - STRUCTURED_LOGGING=true
+      - LOG_TO_FILE=true
+      - LOG_FILE_PATH=/logs/echofleet-qwen3-worker.jsonl
+      - LOG_RETENTION_DAYS=10
+      - JOB_ARTIFACT_RETENTION_DAYS=10
+    volumes:
+      - ./outputs:/workspace/outputs
+      - ./logs:/logs
+      - ./voices:/voices:ro
+      - ./api:/app/api:ro
+      - ./worker:/app/worker:ro
+      - ./utils:/app/utils:ro
+      - ./config:/app/config:ro
+      - ./inference:/app/inference:ro
+      - qwen3_tts_models:/models:ro
+      - stt_models:/stt_models:ro
+    networks:
+      - echofleet-qwen3-network
+
+  # ============================================================================
+  # Gradio UI - Web interface (calls the API)
+  # ============================================================================
+  echofleet-qwen3-ui:
+    image: echofleet-qwen3-tts:local
+    container_name: echofleet-qwen3-ui
+    restart: unless-stopped
+    depends_on:
+      echofleet-qwen3-tts:
+        condition: service_healthy
+    command: ["python", "-m", "ui.gradio_app"]
+    environment:
+      - API_BASE_URL=http://echofleet-qwen3-tts:8000
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+    ports:
+      - "18860:7860"  # Gradio web UI
+    volumes:
+      - ./ui:/app/ui:ro
+    networks:
+      - echofleet-qwen3-network
+
+volumes:
+  redis_data:
+    name: echofleet-qwen3-redis-data
+  qwen3_tts_models:
+    external: true
+  stt_models:
+    name: stt_models
+
+networks:
+  echofleet-qwen3-network:
+    driver: bridge
