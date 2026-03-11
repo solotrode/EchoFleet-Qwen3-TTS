@@ -590,10 +590,31 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
             "sub_workers": max_sub_workers,
         },
     )
+
+    last_job_time = time.time()
+    idle_unload_seconds = int(getattr(settings, "tts_unload_idle_seconds", 300))
+
     while True:
         try:
             # Check for both jobs and commands (use blpop with multiple keys)
             item = redis_client.blpop([queue_name, "tts:commands"], timeout=5)
+
+            # Check for idle models to unload
+            if idle_unload_seconds > 0:
+                idle_time = time.time() - last_job_time
+                if idle_time >= idle_unload_seconds:
+                    try:
+                        unloaded = tts_server.unload_idle_models(idle_seconds=idle_unload_seconds)
+                        if unloaded:
+                            logger.info(
+                                "Unloaded idle models",
+                                extra={"worker_id": worker_id, "device": device, "unloaded": unloaded},
+                            )
+                    except Exception as e:
+                        logger.warning(f"Failed to unload idle models: {e}")
+                    finally:
+                        last_job_time = time.time()
+
             if not item:
                 continue
 
@@ -664,6 +685,7 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                             score_device = _select_score_device()
                             score_task = {"task": "score", "job_id": job_id}
                             redis_client.rpush(_gpu_queue_name(score_device), json.dumps(score_task))
+                last_job_time = time.time()
                 continue
 
             # Score-only task: gather candidates and finalize job.
@@ -699,6 +721,7 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                         f"tts:job:{job_id}",
                         mapping={"status": "failed", "error": str(exc)[:200]},
                     )
+                last_job_time = time.time()
                 continue
 
             # Log full job text for diagnostic purposes
@@ -1146,6 +1169,7 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                         with torch.cuda.device(device_id):
                             torch.cuda.empty_cache()
                     logger.info("GPU memory cleanup completed", extra={"job_id": job_id})
+                    last_job_time = time.time()
 
             except Exception as e:
                 logger.exception("Job failed", exc_info=e)
