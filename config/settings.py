@@ -114,6 +114,14 @@ class Settings:
         self.log_to_file: bool = os.getenv("LOG_TO_FILE", "false").lower() == "true"
         self.log_file_path: str = os.getenv("LOG_FILE_PATH", "")
 
+        # Fish Audio S2 Pro model configuration
+        # Local path where the S2 Pro model is stored (e.g. mounted Docker volume)
+        self.s2_pro_model_dir: str = os.getenv("S2_PRO_MODEL_DIR", "/models/fish-s2-pro")
+        # VCS repo id for reference (not used at runtime, for docs)
+        self.s2_pro_repo_id: str = os.getenv("S2_PRO_REPO_ID", "fishaudio/s2-pro")
+        # Preferred device for S2 Pro (e.g. "cuda:0" or "cpu")
+        self.s2_pro_device: str = os.getenv("S2_PRO_DEVICE", "cuda:0")
+
     def tts_gpu_list(self) -> List[int]:
         """Return TTS GPUs as a list of ints.
         

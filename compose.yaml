@@ -64,6 +64,7 @@ services:
       - LOG_RETENTION_DAYS=10
       - JOB_ARTIFACT_RETENTION_DAYS=10
       - MAX_REQUEST_SIZE=26214400  # 25 MB
+      - S2_PRO_MODEL_DIR=/models_fish-s2-pro
     ports:
       - "18000:8000"  # API server
     volumes:
@@ -76,6 +77,7 @@ services:
       - ./config:/app/config:ro
       - ./inference:/app/inference:ro
       - qwen3_tts_models:/models:ro
+      - fish-tts:/models_fish-s2-pro:ro
       - stt_models:/stt_models:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health"]
@@ -128,6 +130,7 @@ services:
       - LOG_FILE_PATH=/logs/echofleet-qwen3-worker.jsonl
       - LOG_RETENTION_DAYS=10
       - JOB_ARTIFACT_RETENTION_DAYS=10
+      - S2_PRO_MODEL_DIR=/models_fish-s2-pro
     volumes:
       - ./outputs:/workspace/outputs
       - ./logs:/logs
@@ -138,6 +141,7 @@ services:
       - ./config:/app/config:ro
       - ./inference:/app/inference:ro
       - qwen3_tts_models:/models:ro
+      - fish-tts:/models_fish-s2-pro:ro
       - stt_models:/stt_models:ro
     networks:
       - echofleet-qwen3-network
@@ -171,6 +175,8 @@ volumes:
     external: true
   stt_models:
     name: stt_models
+  fish-tts:
+    name: fish-tts
 
 networks:
   echofleet-qwen3-network:

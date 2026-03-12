@@ -18,6 +18,8 @@ from utils.logging import get_logger
 from config.settings import get_settings
 from api.schemas import (
     AudioResponse,
+    # Keep S2ProRequest local to the module that needs it; add import here so the
+    # schema isn't imported at package import time unnecessarily.
     CustomVoiceRequest,
     EnhancedAudioResponse,
     ErrorResponse,
@@ -25,9 +27,33 @@ from api.schemas import (
     VoiceCloneRequest,
     VoiceDesignRequest,
 )
-from inference.qwen_tts_service import QwenTTSServer, wav_to_wav_bytes
-from inference.accuracy_scorer import AccuracyScorer
-from inference.whisper_service import WhisperTranscriberHF, WhisperTranscription
+from api.schemas import S2ProRequest
+# Lazy-import friendly fallbacks: importing heavy inference modules at import
+# time causes test collection and lightweight imports to fail when optional
+# dependencies are missing. Provide graceful fallbacks so the module can be
+# imported in test environments; functions that actually need these classes
+# will raise clear runtime errors when used.
+try:
+    from inference.qwen_tts_service import QwenTTSServer, wav_to_wav_bytes
+except Exception:
+    QwenTTSServer = None
+
+    def wav_to_wav_bytes(wav, sr):
+        raise RuntimeError("inference.qwen_tts_service not available in this environment")
+
+try:
+    from inference.accuracy_scorer import AccuracyScorer
+except Exception:
+    AccuracyScorer = None
+
+try:
+    from inference.whisper_service import WhisperTranscriberHF, WhisperTranscription
+except Exception:
+    WhisperTranscriberHF = None
+
+    class WhisperTranscription:  # minimal stub used for isinstance checks
+        def __init__(self, text: str = ""):
+            self.text = text
 from fastapi import Request
 from fastapi.responses import JSONResponse, FileResponse, Response
 import os
@@ -97,6 +123,102 @@ def get_sync_tts_server() -> QwenTTSServer:
                 _SYNC_TTS_SERVER = QwenTTSServer(settings, assigned_device=device)
                 logger.info("Initialized sync TTS server", extra={"device": device})
     return _SYNC_TTS_SERVER
+
+
+# S2 Pro singleton accessor
+_SYNC_FISH_AUDIO_SERVICE = None
+_SYNC_FISH_AUDIO_LOCK = threading.Lock()
+
+
+def get_sync_fish_audio_service():
+    """Return a singleton FishAudioService for sync S2 Pro calls.
+
+    This lazily imports the `inference.fish_audio_service` module so that the
+    package can be imported in test environments where optional runtime
+    dependencies may be missing.
+    """
+    global _SYNC_FISH_AUDIO_SERVICE
+    if _SYNC_FISH_AUDIO_SERVICE is None:
+        with _SYNC_FISH_AUDIO_LOCK:
+            if _SYNC_FISH_AUDIO_SERVICE is None:
+                try:
+                    from inference.fish_audio_service import FishAudioService
+
+                    _SYNC_FISH_AUDIO_SERVICE = FishAudioService()
+                except Exception as e:
+                    logger.exception("Failed to initialize FishAudioService: %s", e)
+                    raise
+    return _SYNC_FISH_AUDIO_SERVICE
+
+
+# Add s2-pro sync endpoint (shim-backed)
+@app.post(
+    "/v1/tts/s2-pro/sync",
+    response_model=AudioResponse,
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+    tags=["TTS"],
+    summary="Fish Audio S2 Pro plain TTS (sync)",
+)
+async def tts_s2_pro_sync(request: S2ProRequest) -> AudioResponse:
+    """Synchronous plain-TTS endpoint backed by Fish Audio S2 Pro (shim).
+
+    Uses FishAudioService.generate(). Currently the service returns a
+    deterministic 1s sine wave for smoke tests; later this will call the
+    real Fish Audio implementation.
+    """
+    try:
+        svc = get_sync_fish_audio_service()
+
+        wav, sr = svc.generate(request.text, request.language)
+
+        wav_bytes = wav_to_wav_bytes(wav, int(sr))
+        audio_b64 = base64.b64encode(wav_bytes).decode("utf-8")
+        duration = float(len(wav) / sr) if hasattr(wav, "__len__") else 0.0
+
+        job_id = uuid.uuid4().hex
+        out_path = ""
+        try:
+            out_dir = settings.output_dir
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, f"{job_id}.wav")
+            with open(out_path, "wb") as f:
+                f.write(wav_bytes)
+            logger.info("Wrote generated WAV to disk (s2-pro sync)", extra={"job_id": job_id, "path": out_path})
+        except Exception:
+            logger.warning("Failed to persist WAV to disk for s2-pro synchronous request", exc_info=True)
+
+        download_url = f"/v1/audio/{job_id}.wav"
+        redis_client.hset(f"tts:job:{job_id}", mapping={
+            "status": "done",
+            "audio_base64": audio_b64,
+            "sample_rate": int(sr),
+            "duration_seconds": duration,
+            "wav_path": out_path,
+            "download_url": download_url,
+            "completed_at": str(time.time()),
+        })
+
+        return AudioResponse(
+            audio_base64=audio_b64,
+            sample_rate=int(sr),
+            duration_seconds=duration,
+            format="wav",
+            model="s2-pro",
+            job_id=job_id,
+            download_url=download_url,
+        )
+
+    except FileNotFoundError as e:
+        logger.exception("S2 Pro model unavailable")
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except NotImplementedError as e:
+        logger.exception("S2 Pro generate not implemented")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    except Exception as e:
+        logger.exception("S2 Pro synchronous request failed")
+        raise HTTPException(status_code=500, detail="Internal error") from e
 
 
 def _generate_candidate(
@@ -1763,6 +1885,82 @@ async def tts_voice_design_sync(request: VoiceDesignRequest) -> AudioResponse:
         masked = _masked_exc(exc)
         logger.exception("Voice-design request failed", exc_info=(type(exc), masked, exc.__traceback__))
         raise HTTPException(status_code=500, detail=f"Internal error") from exc
+
+
+@app.post(
+    "/v1/tts/s2-pro/sync",
+    response_model=AudioResponse,
+    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+    tags=["TTS"],
+    summary="Fish Audio S2 Pro plain TTS (sync)",
+)
+async def tts_s2_pro_sync(request: S2ProRequest) -> AudioResponse:
+    """Synchronous plain-TTS endpoint backed by Fish Audio S2 Pro.
+
+    This is intentionally narrow: accepts plain text and optional language,
+    calls a synchronous FishAudioService.generate, persists the WAV, writes a
+    minimal Redis job record, and returns an `AudioResponse` with
+    `model="s2-pro"`.
+    """
+    try:
+        svc = get_sync_fish_audio_service()
+
+        # Generate waveform
+        wav, sr = svc.generate(request.text, request.language)
+
+        # Serialize to WAV bytes
+        wav_bytes = wav_to_wav_bytes(wav, int(sr))
+
+        audio_b64 = base64.b64encode(wav_bytes).decode("utf-8")
+        duration = float(len(wav) / sr) if hasattr(wav, "__len__") else 0.0
+
+        # Persist output and create a job record so callers can download later
+        job_id = uuid.uuid4().hex
+        out_path = ""
+        try:
+            out_dir = settings.output_dir
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, f"{job_id}.wav")
+            with open(out_path, "wb") as f:
+                f.write(wav_bytes)
+            logger.info("Wrote generated WAV to disk (s2-pro sync)", extra={"job_id": job_id, "path": out_path})
+        except Exception:
+            logger.warning("Failed to persist WAV to disk for s2-pro synchronous request", exc_info=True)
+
+        download_url = f"/v1/audio/{job_id}.wav"
+        redis_client.hset(f"tts:job:{job_id}", mapping={
+            "status": "done",
+            "audio_base64": audio_b64,
+            "sample_rate": int(sr),
+            "duration_seconds": duration,
+            "wav_path": out_path,
+            "download_url": download_url,
+            "completed_at": str(time.time()),
+        })
+
+        return AudioResponse(
+            audio_base64=audio_b64,
+            sample_rate=int(sr),
+            duration_seconds=duration,
+            format="wav",
+            model="s2-pro",
+            job_id=job_id,
+            download_url=download_url,
+        )
+
+    except FileNotFoundError as e:
+        # Model files unavailable
+        logger.exception("S2 Pro model unavailable")
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except NotImplementedError as e:
+        # Stub/implementation not ready
+        logger.exception("S2 Pro generate not implemented")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    except Exception as e:
+        logger.exception("S2 Pro synchronous request failed")
+        raise HTTPException(status_code=500, detail="Internal error") from e
 
 
 @app.post(
