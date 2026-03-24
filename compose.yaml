@@ -81,7 +81,7 @@ services:
       - ./config:/app/config:ro
       - ./inference:/app/inference:ro
       - qwen3_tts_models:/models:ro
-      - fish-tts:/models_fish-s2-pro
+      - fish-tts:/models_fish-s2-pro:ro
       - stt_models:/stt_models:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health"]
@@ -135,6 +135,8 @@ services:
       - LOG_RETENTION_DAYS=10
       - JOB_ARTIFACT_RETENTION_DAYS=10
       - S2_PRO_MODEL_DIR=/models_fish-s2-pro
+      - SGLANG_BASE_URL=http://fish-sglang:8000
+      - FISH_REF_AUDIO_DIR=/voices
     volumes:
       - ./outputs:/workspace/outputs
       - ./logs:/logs
