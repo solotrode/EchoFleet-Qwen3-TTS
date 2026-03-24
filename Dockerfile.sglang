@@ -1,0 +1,236 @@
+# Fish Audio SGLang Server (S2 Pro TTS + Voice Cloning)
+# Build from https://github.com/sgl-project/sglang-omni
+
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+ARG SGLANG_OMNI_REF=2f25198f926e289e0f90c1d3d4aad0cd515255a7  # Pinned to specific commit for reproducibility
+
+# Install Python and dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    git \
+    curl \
+    ca-certificates \
+    libnuma1 \
+    libibverbs1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py && \
+    python3.12 /tmp/get-pip.py && \
+    rm /tmp/get-pip.py && \
+    rm -rf /var/lib/apt/lists/*
+
+# Clone and install sglang-omni
+RUN git clone --branch ${SGLANG_OMNI_REF} --depth 1 https://github.com/sgl-project/sglang-omni.git /app/sglang-omni && \
+    cd /app/sglang-omni && \
+    python3.12 -m pip install --no-cache-dir --upgrade pip uv && \
+    uv venv ${VIRTUAL_ENV} -p python3.12 && \
+    uv pip install -v ".[s2pro]" && \
+    python - <<'PY'
+from pathlib import Path
+import shutil
+
+source_configs = Path('/app/sglang-omni/sglang_omni/models/fishaudio_s2_pro/fish_speech/configs')
+target_configs = Path('/opt/venv/lib/python3.12/site-packages/sglang_omni/models/fishaudio_s2_pro/fish_speech/configs')
+target_configs.parent.mkdir(parents=True, exist_ok=True)
+if target_configs.exists():
+    shutil.rmtree(target_configs)
+shutil.copytree(source_configs, target_configs)
+PY
+RUN python - <<'PY'
+from pathlib import Path
+
+sitecustomize = Path('/opt/venv/lib/python3.12/site-packages/sitecustomize.py')
+sitecustomize.write_text(
+    '"""Bootstrap custom model registration for sglang-omni."""\n'
+    'try:\n'
+    '    import sglang_omni.models.fishaudio_s2_pro.fish_speech.models.text2semantic.modeling\n'
+    'except Exception:\n'
+    '    pass\n',
+    encoding='utf-8',
+)
+PY
+
+RUN python - <<'PY'
+from pathlib import Path
+
+launcher = Path('/usr/local/bin/start-sglang-s2pro')
+launcher.write_text(
+    '#!/opt/venv/bin/python\n'
+    'import runpy\n'
+    'import sys\n'
+    'import sglang_omni.models.fishaudio_s2_pro.fish_speech.models.text2semantic\n'
+    'sys.argv = [\"sglang_omni\", *sys.argv[1:]]\n'
+    'runpy.run_module(\"sglang_omni.cli.cli\", run_name=\"__main__\")\n',
+    encoding='utf-8',
+)
+launcher.chmod(0o755)
+PY
+
+RUN python - <<'PY'
+from pathlib import Path
+
+factory = Path('/opt/venv/lib/python3.12/site-packages/sglang_omni/models/fishaudio_s2_pro/factory.py')
+text = factory.read_text(encoding='utf-8')
+old = '    if server_args.attention_backend is None:\n        server_args.attention_backend = "fa3"\n'
+new = '    if server_args.attention_backend is None:\n        server_args.attention_backend = "triton"\n'
+if old not in text:
+    raise SystemExit('Expected attention backend snippet not found in factory.py')
+factory.write_text(text.replace(old, new, 1), encoding='utf-8')
+PY
+
+RUN python - <<'PY'
+from pathlib import Path
+
+factory = Path('/opt/venv/lib/python3.12/site-packages/sglang_omni/models/fishaudio_s2_pro/factory.py')
+text = factory.read_text(encoding='utf-8')
+old = '''from .runtime.s2pro_sglang_ar import (
+    S2ProSGLangIterationController,
+    S2ProSGLangModelRunner,
+    S2ProSGLangResourceManager,
+)
+'''
+new = '''from .runtime.s2pro_sglang_ar import (
+    S2ProSGLangIterationController,
+    S2ProSGLangModelRunner,
+    S2ProSGLangOutputProcessor,
+    S2ProSGLangResourceManager,
+)
+'''
+if old not in text:
+    raise SystemExit('Expected runtime import block not found in factory.py')
+factory.write_text(text.replace(old, new, 1), encoding='utf-8')
+PY
+
+RUN python - <<'PY'
+from pathlib import Path
+
+modeling = Path('/opt/venv/lib/python3.12/site-packages/sglang_omni/models/fishaudio_s2_pro/fish_speech/models/text2semantic/modeling.py')
+text = modeling.read_text(encoding='utf-8')
+
+old_flag = '''FISH_BATCH_INVARIANT = os.getenv("FISH_BATCH_INVARIANT", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+'''
+new_flag = old_flag + '''
+FISH_FORCE_SDPA_KVCACHE = os.getenv("FISH_FORCE_SDPA_KVCACHE", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+'''
+if old_flag not in text:
+    raise SystemExit('Expected FISH_BATCH_INVARIANT snippet not found in modeling.py')
+text = text.replace(old_flag, new_flag, 1)
+
+old_block = '''        # Use flash_attn_with_kvcache - it handles KV cache update internally
+        # q: (batch_size, seqlen, nheads, headdim)
+        # k_cache/v_cache: (batch_size, seqlen_cache, nheads_k, headdim)
+        # k/v: (batch_size, seqlen_new, nheads_k, headdim)
+        k_cache, v_cache = self.kv_cache.get(bsz)
+        y = flash_attn_kvcache_op(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k=k,
+            v=v,
+            cache_seqlens=cache_seqlens,
+            causal=True,
+            num_splits=1 if FISH_BATCH_INVARIANT else 0,
+        )
+
+        y = y.contiguous().view(bsz, seqlen, q_size)
+'''
+
+new_block = '''        # Prefer a portable SDPA fallback for KV-cache decode on GPUs where the
+        # flash-attn kernel is unavailable.
+        k_cache, v_cache = self.kv_cache.get(bsz)
+        y = None
+
+        if not FISH_FORCE_SDPA_KVCACHE:
+            try:
+                y = flash_attn_kvcache_op(
+                    q=q,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    k=k,
+                    v=v,
+                    cache_seqlens=cache_seqlens,
+                    causal=True,
+                    num_splits=1 if FISH_BATCH_INVARIANT else 0,
+                )
+            except RuntimeError as exc:
+                if "no kernel image is available for execution on the device" not in str(exc):
+                    raise
+                log.warning("Falling back to SDPA KV-cache decode: %s", exc)
+
+        if y is None:
+            start_positions = cache_seqlens.to(torch.int64)
+            for batch_idx in range(bsz):
+                start = int(start_positions[batch_idx].item())
+                end = start + seqlen
+                k_cache[batch_idx, start:end] = k[batch_idx]
+                v_cache[batch_idx, start:end] = v[batch_idx]
+
+            total_lengths = start_positions + seqlen
+            max_total = int(total_lengths.max().item())
+
+            q = q.transpose(1, 2)
+            full_k = k_cache[:bsz, :max_total].transpose(1, 2)
+            full_v = v_cache[:bsz, :max_total].transpose(1, 2)
+            full_k = full_k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+            full_v = full_v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+
+            key_positions = torch.arange(max_total, device=q.device)
+            query_positions = start_positions[:, None] + torch.arange(seqlen, device=q.device)[None, :]
+            valid_mask = key_positions.view(1, 1, max_total) <= query_positions.unsqueeze(-1)
+            valid_mask = valid_mask & (key_positions.view(1, 1, max_total) < total_lengths.view(-1, 1, 1))
+            attn_mask = valid_mask.unsqueeze(1)
+
+            y = self._scaled_dot_product_attention(
+                q,
+                full_k,
+                full_v,
+                attn_mask=attn_mask,
+                is_causal=False,
+            )
+            y = y.transpose(1, 2)
+
+        y = y.contiguous().view(bsz, seqlen, q_size)
+'''
+
+if old_block not in text:
+    raise SystemExit('Expected KV-cache block not found in modeling.py')
+text = text.replace(old_block, new_block, 1)
+modeling.write_text(text, encoding='utf-8')
+PY
+
+RUN python - <<'PY'
+from pathlib import Path
+
+stages = Path('/opt/venv/lib/python3.12/site-packages/sglang_omni/models/fishaudio_s2_pro/pipeline/stages.py')
+text = stages.read_text(encoding='utf-8')
+old = '        disable_cuda_graph=False,\n'
+new = '        disable_cuda_graph=True,\n'
+if old not in text:
+    raise SystemExit('Expected disable_cuda_graph snippet not found in stages.py')
+stages.write_text(text.replace(old, new, 1), encoding='utf-8')
+PY
+
+# Set working directory
+WORKDIR /app/sglang-omni
+
+# Default command
+CMD ["start-sglang-s2pro", "serve", "--model-path", "fishaudio/s2-pro", "--config", "/app/sglang-omni/examples/configs/s2pro_tts.yaml", "--stages.2.executor.args.device", "cpu", "--port", "8000"]
