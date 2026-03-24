@@ -125,7 +125,9 @@ old_flag = '''FISH_BATCH_INVARIANT = os.getenv("FISH_BATCH_INVARIANT", "false").
 )
 '''
 new_flag = old_flag + '''
-FISH_FORCE_SDPA_KVCACHE = os.getenv("FISH_FORCE_SDPA_KVCACHE", "true").lower() in (
+# Default to false - flash-attn-kvcache is faster on supported GPUs
+# Set to true only on GPUs where flash-attn kernel is unavailable
+FISH_FORCE_SDPA_KVCACHE = os.getenv("FISH_FORCE_SDPA_KVCACHE", "false").lower() in (
     "true",
     "1",
     "yes",
