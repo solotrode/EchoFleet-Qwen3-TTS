@@ -151,74 +151,7 @@ def get_sync_fish_audio_service():
     return _SYNC_FISH_AUDIO_SERVICE
 
 
-# Add s2-pro sync endpoint (shim-backed)
-@app.post(
-    "/v1/tts/s2-pro/sync",
-    response_model=AudioResponse,
-    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
-    tags=["TTS"],
-    summary="Fish Audio S2 Pro plain TTS (sync)",
-)
-async def tts_s2_pro_sync(request: S2ProRequest) -> AudioResponse:
-    """Synchronous plain-TTS endpoint backed by Fish Audio S2 Pro (shim).
-
-    Uses FishAudioService.generate(). Currently the service returns a
-    deterministic 1s sine wave for smoke tests; later this will call the
-    real Fish Audio implementation.
-    """
-    try:
-        svc = get_sync_fish_audio_service()
-
-        wav, sr = svc.generate(request.text, request.language)
-
-        wav_bytes = wav_to_wav_bytes(wav, int(sr))
-        audio_b64 = base64.b64encode(wav_bytes).decode("utf-8")
-        duration = float(len(wav) / sr) if hasattr(wav, "__len__") else 0.0
-
-        job_id = uuid.uuid4().hex
-        out_path = ""
-        try:
-            out_dir = settings.output_dir
-            os.makedirs(out_dir, exist_ok=True)
-            out_path = os.path.join(out_dir, f"{job_id}.wav")
-            with open(out_path, "wb") as f:
-                f.write(wav_bytes)
-            logger.info("Wrote generated WAV to disk (s2-pro sync)", extra={"job_id": job_id, "path": out_path})
-        except Exception:
-            logger.warning("Failed to persist WAV to disk for s2-pro synchronous request", exc_info=True)
-
-        download_url = f"/v1/audio/{job_id}.wav"
-        redis_client.hset(f"tts:job:{job_id}", mapping={
-            "status": "done",
-            "audio_base64": audio_b64,
-            "sample_rate": int(sr),
-            "duration_seconds": duration,
-            "wav_path": out_path,
-            "download_url": download_url,
-            "completed_at": str(time.time()),
-        })
-
-        return AudioResponse(
-            audio_base64=audio_b64,
-            sample_rate=int(sr),
-            duration_seconds=duration,
-            format="wav",
-            model="s2-pro",
-            job_id=job_id,
-            download_url=download_url,
-        )
-
-    except FileNotFoundError as e:
-        logger.exception("S2 Pro model unavailable")
-        raise HTTPException(status_code=503, detail=str(e)) from e
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    except NotImplementedError as e:
-        logger.exception("S2 Pro generate not implemented")
-        raise HTTPException(status_code=500, detail=str(e)) from e
-    except Exception as e:
-        logger.exception("S2 Pro synchronous request failed")
-        raise HTTPException(status_code=500, detail="Internal error") from e
+# s2-pro endpoint is registered after app is created below
 
 
 def _generate_candidate(
@@ -1905,8 +1838,9 @@ async def tts_s2_pro_sync(request: S2ProRequest) -> AudioResponse:
     try:
         svc = get_sync_fish_audio_service()
 
-        # Generate waveform
-        wav, sr = svc.generate(request.text, request.language)
+        # Generate waveform - run in executor to avoid blocking event loop
+        loop = asyncio.get_event_loop()
+        wav, sr = await loop.run_in_executor(None, svc.generate, request.text, request.language)
 
         # Serialize to WAV bytes
         wav_bytes = wav_to_wav_bytes(wav, int(sr))
