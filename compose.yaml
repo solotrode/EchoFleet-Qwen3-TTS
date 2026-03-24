@@ -36,6 +36,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      fish-sglang:
+        condition: service_healthy
     deploy:
       resources:
         reservations:
@@ -65,6 +67,8 @@ services:
       - JOB_ARTIFACT_RETENTION_DAYS=10
       - MAX_REQUEST_SIZE=26214400  # 25 MB
       - S2_PRO_MODEL_DIR=/models_fish-s2-pro
+      - SGLANG_BASE_URL=http://fish-sglang:8000
+      - FISH_REF_AUDIO_DIR=/voices
     ports:
       - "18000:8000"  # API server
     volumes:
@@ -77,7 +81,7 @@ services:
       - ./config:/app/config:ro
       - ./inference:/app/inference:ro
       - qwen3_tts_models:/models:ro
-      - fish-tts:/models_fish-s2-pro:ro
+      - fish-tts:/models_fish-s2-pro
       - stt_models:/stt_models:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health"]
@@ -147,6 +151,46 @@ services:
       - echofleet-qwen3-network
 
   # ============================================================================
+  # Fish Audio SGLang Server (S2 Pro TTS + Voice Cloning)
+  # Build from source: https://github.com/sgl-project/sglang-omni
+  # ============================================================================
+  fish-sglang:
+    build:
+      context: .
+      dockerfile: Dockerfile.sglang
+    container_name: fish-sglang
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s
+    environment:
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - HF_TOKEN=${HUGGINGFACE_HUB_TOKEN}
+    ports:
+      - "18001:8000"  # SGLang API on port 8001
+    volumes:
+      - fish-tts:/data  # Model files
+      - ./voices:/voices:ro  # Reference audio (shared with echofleet)
+    command: >
+      start-sglang-s2pro serve
+      --model-path fishaudio/s2-pro
+      --config /app/sglang-omni/examples/configs/s2pro_tts.yaml
+      --stages.2.executor.args.device cpu
+      --port 8000
+    networks:
+      - echofleet-qwen3-network
+
+  # ============================================================================
   # Gradio UI - Web interface (calls the API)
   # ============================================================================
   echofleet-qwen3-ui:
@@ -174,9 +218,9 @@ volumes:
   qwen3_tts_models:
     external: true
   stt_models:
-    name: stt_models
+    external: true
   fish-tts:
-    name: fish-tts
+    external: true
 
 networks:
   echofleet-qwen3-network:
