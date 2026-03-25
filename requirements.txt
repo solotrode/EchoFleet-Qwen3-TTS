@@ -63,7 +63,8 @@ rq>=1.15.1
 # Use HuggingFace/Transformers Whisper instead of the `openai-whisper` package.
 # Reason: `openai-whisper` pins `triton<3`, which conflicts with PyTorch 2.7 (Linux uses triton==3.x).
 # Model repo: https://huggingface.co/openai/whisper-large-v3-turbo
-torchcodec>=0.3.0
+# Note: torchcodec is intentionally excluded. transformers tries it as an audio backend and it
+# fails to load (libtorch.so not on LD_LIBRARY_PATH). soundfile/librosa handle audio instead.
 jiwer==3.0.3
 whisper-normalizer==0.1.12
 

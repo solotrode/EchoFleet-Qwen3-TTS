@@ -91,6 +91,12 @@ class Settings:
         self.max_candidates: int = int(os.getenv("MAX_CANDIDATES", "10"))
         self.default_candidates: int = int(os.getenv("DEFAULT_CANDIDATES", "1"))
         self.job_timeout: int = int(os.getenv("JOB_TIMEOUT", "3600"))
+        self.tts_candidate_stale_seconds: int = int(
+            os.getenv("TTS_CANDIDATE_STALE_SECONDS", "900")
+        )
+        self.tts_candidate_rescue_attempts: int = int(
+            os.getenv("TTS_CANDIDATE_RESCUE_ATTEMPTS", "2")
+        )
         
         # Cleanup and retention
         self.retention_hours: int = int(os.getenv("RETENTION_HOURS", "24"))

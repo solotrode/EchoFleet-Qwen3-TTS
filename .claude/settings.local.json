@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker ps:*)",
+      "Bash(docker exec echofleet-qwen3-worker python3 -c \":*)",
+      "Bash(docker exec echofleet-qwen3-worker bash -c \":*)",
+      "Bash(docker exec:*)"
+    ]
+  }
+}

@@ -106,6 +106,79 @@ def _load_job_payload(job_id: str) -> Dict[str, Any]:
         return {}
 
 
+def _job_candidate_state_key(job_id: str) -> str:
+    """Return the Redis hash key used for per-candidate state."""
+    return f"tts:job:{job_id}:candidate_state"
+
+
+def _job_candidate_terminal_key(job_id: str) -> str:
+    """Return the Redis hash key used for terminal candidate outcomes."""
+    return f"tts:job:{job_id}:candidate_terminal"
+
+
+def _encode_candidate_state(
+    *,
+    status: str,
+    assigned_gpu: str,
+    updated_at: float,
+    rescue_count: int = 0,
+    **extra: Any,
+) -> str:
+    """Serialize per-candidate queue state for Redis storage."""
+    payload: Dict[str, Any] = {
+        "status": status,
+        "assigned_gpu": assigned_gpu,
+        "updated_at": updated_at,
+        "rescue_count": int(rescue_count),
+    }
+    payload.update(extra)
+    return json.dumps(payload)
+
+
+def _decode_candidate_state(raw: str) -> Dict[str, Any]:
+    """Deserialize a per-candidate state payload from Redis."""
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _set_candidate_state(
+    job_id: str,
+    candidate_id: int,
+    *,
+    status: str,
+    assigned_gpu: str,
+    updated_at: float,
+    rescue_count: int = 0,
+    **extra: Any,
+) -> None:
+    """Persist per-candidate queue state in Redis."""
+    redis_client.hset(
+        _job_candidate_state_key(job_id),
+        str(candidate_id),
+        _encode_candidate_state(
+            status=status,
+            assigned_gpu=assigned_gpu,
+            updated_at=updated_at,
+            rescue_count=rescue_count,
+            **extra,
+        ),
+    )
+
+
+def _maybe_enqueue_score_task(job_id: str, expected: int) -> None:
+    """Enqueue scoring once all candidates have reached a terminal state."""
+    if expected <= 1:
+        return
+
+    if redis_client.setnx(f"tts:job:{job_id}:score_enqueued", "1"):
+        score_device = _select_score_device()
+        score_task = {"task": "score", "job_id": job_id}
+        redis_client.rpush(_gpu_queue_name(score_device), json.dumps(score_task))
+
+
 def get_sync_tts_server() -> QwenTTSServer:
     """Return a singleton TTS server for synchronous API endpoints.
 
@@ -750,6 +823,16 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
             if task_type == "candidate":
                 candidate_id = int(job.get("candidate_id", 0))
                 num_candidates = int(job.get("num_candidates", 1))
+                assigned_gpu = str(job.get("assigned_gpu") or device)
+                rescue_count = int(job.get("rescue_count", 0) or 0)
+                _set_candidate_state(
+                    job_id,
+                    candidate_id,
+                    status="started",
+                    assigned_gpu=assigned_gpu,
+                    updated_at=time.time(),
+                    rescue_count=rescue_count,
+                )
                 result = _generate_candidate(
                     tts_server,
                     job.get("text"),
@@ -760,19 +843,56 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                     job_id,
                     candidate_id,
                 )
-                if result:
-                    redis_client.rpush(f"tts:job:{job_id}:candidates", json.dumps(result))
-                    completed = redis_client.hincrby(
+                terminal_state = "completed" if result else "failed"
+                was_first_terminal = bool(
+                    redis_client.hsetnx(
+                        _job_candidate_terminal_key(job_id),
+                        str(candidate_id),
+                        terminal_state,
+                    )
+                )
+
+                if was_first_terminal:
+                    if result:
+                        redis_client.rpush(f"tts:job:{job_id}:candidates", json.dumps(result))
+                        redis_client.hincrby(
+                            f"tts:job:{job_id}",
+                            "completed_candidates",
+                            1,
+                        )
+                    else:
+                        redis_client.hincrby(
+                            f"tts:job:{job_id}",
+                            "failed_candidates",
+                            1,
+                        )
+
+                    settled = redis_client.hincrby(
                         f"tts:job:{job_id}",
-                        "completed_candidates",
+                        "settled_candidates",
                         1,
                     )
+                    _set_candidate_state(
+                        job_id,
+                        candidate_id,
+                        status=terminal_state,
+                        assigned_gpu=assigned_gpu,
+                        updated_at=time.time(),
+                        rescue_count=rescue_count,
+                    )
                     expected = int(job.get("num_candidates", 1))
-                    if completed >= expected and expected > 1:
-                        if redis_client.setnx(f"tts:job:{job_id}:score_enqueued", "1"):
-                            score_device = _select_score_device()
-                            score_task = {"task": "score", "job_id": job_id}
-                            redis_client.rpush(_gpu_queue_name(score_device), json.dumps(score_task))
+                    if settled >= expected:
+                        _maybe_enqueue_score_task(job_id, expected)
+                else:
+                    logger.info(
+                        "Ignoring duplicate candidate terminal outcome",
+                        extra={
+                            "job_id": job_id,
+                            "candidate_id": candidate_id,
+                            "terminal_state": terminal_state,
+                            "assigned_gpu": assigned_gpu,
+                        },
+                    )
                 last_job_time = time.time()
                 continue
 
