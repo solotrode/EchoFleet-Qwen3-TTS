@@ -128,6 +128,8 @@ def get_sync_tts_server() -> QwenTTSServer:
 # S2 Pro singleton accessor
 _SYNC_FISH_AUDIO_SERVICE = None
 _SYNC_FISH_AUDIO_LOCK = threading.Lock()
+_FISH_IDLE_WATCHER_THREAD: Optional[threading.Thread] = None
+_FISH_IDLE_WATCHER_STOP = threading.Event()
 
 
 def get_sync_fish_audio_service():
@@ -149,6 +151,27 @@ def get_sync_fish_audio_service():
                     logger.exception("Failed to initialize FishAudioService: %s", e)
                     raise
     return _SYNC_FISH_AUDIO_SERVICE
+
+
+def _run_fish_idle_watcher() -> None:
+    """Unload the sync Fish backend after the configured idle timeout."""
+    poll_interval = 5.0
+    idle_unload_seconds = int(getattr(settings, "tts_unload_idle_seconds", 300))
+
+    while not _FISH_IDLE_WATCHER_STOP.wait(timeout=poll_interval):
+        if idle_unload_seconds <= 0:
+            continue
+
+        svc = _SYNC_FISH_AUDIO_SERVICE
+        if svc is None:
+            continue
+
+        try:
+            unloaded = svc.unload_idle_models(idle_seconds=idle_unload_seconds)
+            if unloaded:
+                logger.info("Unloaded idle Fish backend", extra={"unloaded": unloaded})
+        except Exception:
+            logger.exception("Failed to unload idle Fish backend")
 
 
 # s2-pro endpoint is registered after app is created below
@@ -615,6 +638,16 @@ async def startup_event():
         )
     else:
         logger.info("In-process job workers disabled.", extra={"concurrency": raw_concurrency})
+
+    global _FISH_IDLE_WATCHER_THREAD
+    if _FISH_IDLE_WATCHER_THREAD is None or not _FISH_IDLE_WATCHER_THREAD.is_alive():
+        _FISH_IDLE_WATCHER_STOP.clear()
+        _FISH_IDLE_WATCHER_THREAD = threading.Thread(
+            target=_run_fish_idle_watcher,
+            name="fish-idle-watcher",
+            daemon=True,
+        )
+        _FISH_IDLE_WATCHER_THREAD.start()
 
 
 def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
@@ -1248,6 +1281,13 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
 async def shutdown_event():
     """Cleanup resources on shutdown."""
     logger.info("Shutting down Qwen3-TTS API server")
+    _FISH_IDLE_WATCHER_STOP.set()
+    svc = _SYNC_FISH_AUDIO_SERVICE
+    if svc is not None:
+        try:
+            svc.unload_model("s2-pro")
+        except Exception:
+            logger.exception("Failed to unload Fish backend during shutdown")
 
 
 @app.get("/")
@@ -1603,6 +1643,15 @@ async def unload_models(model_type: Optional[str] = None):
         if running_jobs:
             return {"status": "blocked", "running_jobs": running_jobs}
 
+        fish_unloaded = []
+        if model_type in (None, "s2-pro"):
+            svc = _SYNC_FISH_AUDIO_SERVICE
+            if svc is not None:
+                fish_unloaded = svc.unload_model("s2-pro")
+
+            if model_type == "s2-pro":
+                return {"status": "ok", "unloaded": fish_unloaded}
+
         # Send unload command to worker via Redis
         cmd_id = uuid.uuid4().hex
         cmd_payload = {
@@ -1621,8 +1670,9 @@ async def unload_models(model_type: Optional[str] = None):
             result = redis_client.hgetall(f"tts:cmd:{cmd_id}")
             if result and result.get("status") == "done":
                 unloaded = json.loads(result.get("result", "[]"))
-                logger.info(f"Worker unload completed: {unloaded}")
-                return {"status": "ok", "unloaded": unloaded}
+                combined_unloaded = list(unloaded) + list(fish_unloaded)
+                logger.info(f"Worker unload completed: {combined_unloaded}")
+                return {"status": "ok", "unloaded": combined_unloaded}
             elif result and result.get("status") == "error":
                 error = result.get("error", "Unknown error")
                 logger.error(f"Worker unload failed: {error}")
@@ -1665,6 +1715,14 @@ async def models_status():
                     "device": device,
                     "param_device": param_device,
                 })
+
+        fish_service = _SYNC_FISH_AUDIO_SERVICE
+        fish_status = fish_service.status() if fish_service is not None else {
+            "model_type": "s2-pro",
+            "loaded": False,
+            "backend": "remote",
+            "initialized": False,
+        }
         
         gpu_memory = []
         if torch.cuda.is_available():
@@ -1679,6 +1737,7 @@ async def models_status():
         
         return {
             "cached_models": cached_models,
+            "fish_backend": fish_status,
             "gpu_memory": gpu_memory,
             "model_count": len(cached_models),
         }

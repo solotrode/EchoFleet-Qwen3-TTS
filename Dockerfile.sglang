@@ -31,8 +31,9 @@ RUN add-apt-repository ppa:deadsnakes/ppa && \
     rm -rf /var/lib/apt/lists/*
 
 # Clone and install sglang-omni
-RUN git clone --branch ${SGLANG_OMNI_REF} --depth 1 https://github.com/sgl-project/sglang-omni.git /app/sglang-omni && \
+RUN git clone https://github.com/sgl-project/sglang-omni.git /app/sglang-omni && \
     cd /app/sglang-omni && \
+    git checkout ${SGLANG_OMNI_REF} && \
     python3.12 -m pip install --no-cache-dir --upgrade pip uv && \
     uv venv ${VIRTUAL_ENV} -p python3.12 && \
     uv pip install -v ".[s2pro]" && \
@@ -110,6 +111,89 @@ new = '''from .runtime.s2pro_sglang_ar import (
 if old not in text:
     raise SystemExit('Expected runtime import block not found in factory.py')
 factory.write_text(text.replace(old, new, 1), encoding='utf-8')
+PY
+
+RUN python - <<'PY'
+from pathlib import Path
+
+factory = Path('/opt/venv/lib/python3.12/site-packages/sglang_omni/models/fishaudio_s2_pro/factory.py')
+text = factory.read_text(encoding='utf-8')
+
+old_imports = '''import logging
+import time
+from typing import Any
+'''
+new_imports = '''import logging
+import os
+import time
+from typing import Any
+'''
+if old_imports not in text:
+    raise SystemExit('Expected factory import block not found for warmup patch')
+text = text.replace(old_imports, new_imports, 1)
+
+old_call = '    _warmup_codebook_fn(output_processor, model_worker, semantic_begin_id, top_k)\n'
+new_call = '''    if os.getenv("FISH_ENABLE_CODEBOOK_WARMUP", "false").lower() in ("true", "1", "yes"):
+        _warmup_codebook_fn(output_processor, model_worker, semantic_begin_id, top_k)
+'''
+if old_call not in text:
+    raise SystemExit('Expected codebook warmup call not found in factory.py')
+text = text.replace(old_call, new_call, 1)
+
+factory.write_text(text, encoding='utf-8')
+PY
+
+RUN python - <<'PY'
+from pathlib import Path
+
+factory = Path('/opt/venv/lib/python3.12/site-packages/sglang_omni/models/fishaudio_s2_pro/factory.py')
+text = factory.read_text(encoding='utf-8')
+
+old = '''    if server_args.attention_backend is None:
+        server_args.attention_backend = "triton"
+
+    # Enable hidden state capture for unified decode
+'''
+new = '''    if server_args.attention_backend is None:
+        server_args.attention_backend = "triton"
+
+    server_args.mem_fraction_static = max(
+        float(getattr(server_args, "mem_fraction_static", 0.85)), 0.9
+    )
+
+    # Enable hidden state capture for unified decode
+'''
+if old not in text:
+    raise SystemExit('Expected attention backend block not found for mem_fraction patch')
+text = text.replace(old, new, 1)
+
+factory.write_text(text, encoding='utf-8')
+PY
+
+RUN python - <<'PY'
+from pathlib import Path
+
+runtime = Path('/opt/venv/lib/python3.12/site-packages/sglang_omni/models/fishaudio_s2_pro/runtime/s2pro_sglang_ar.py')
+text = runtime.read_text(encoding='utf-8')
+
+old_imports = '''import torch
+from sglang.srt.mem_cache.common import release_kv_cache
+'''
+new_imports = '''import torch
+from torch import Tensor
+from sglang.srt.mem_cache.common import release_kv_cache
+'''
+if old_imports not in text:
+    raise SystemExit('Expected torch import block not found in s2pro_sglang_ar.py')
+text = text.replace(old_imports, new_imports, 1)
+
+old_helper_import = 'from .s2pro_ar import S2ProStepOutput\n'
+new_helper_import = 'from .s2pro_ar import S2ProStepOutput, _sample_with_topk\n'
+if old_helper_import not in text:
+    raise SystemExit('Expected helper import line not found in s2pro_sglang_ar.py')
+text = text.replace(old_helper_import, new_helper_import, 1)
+
+runtime.write_text(text, encoding='utf-8')
 PY
 
 RUN python - <<'PY'

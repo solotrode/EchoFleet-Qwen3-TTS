@@ -63,7 +63,7 @@ COPY constraints-cu128-py312.txt /tmp/constraints-cu128-py312.txt
 RUN pip install \
     --index-url https://download.pytorch.org/whl/cu128 \
     -c /tmp/constraints-cu128-py312.txt \
-    torch==2.10.0+cu128 torchvision torchaudio
+    torch==2.10.0+cu128 torchvision==0.25.0+cu128 torchaudio==2.10.0+cu128
 
 # Install prebuilt FlashAttention wheel (compatible with PyTorch 2.10 + cu128).
 # Using the provided prebuilt wheel to accelerate attention kernels.
@@ -82,7 +82,7 @@ RUN pip install \
     --index-url https://download.pytorch.org/whl/cu128 \
     --force-reinstall --no-deps \
     -c /tmp/constraints-cu128-py312.txt \
-    torch==2.10.0+cu128 torchvision torchaudio
+    torch==2.10.0+cu128 torchvision==0.25.0+cu128 torchaudio==2.10.0+cu128
 
 # Install Qwen3-TTS (editable) without letting it resolve deps (we control deps above)
 RUN git clone https://github.com/QwenLM/Qwen3-TTS.git /opt/Qwen3-TTS && \
@@ -118,4 +118,3 @@ USER appuser
 EXPOSE 8000 7860
 
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
-

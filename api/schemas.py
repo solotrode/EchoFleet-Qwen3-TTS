@@ -93,6 +93,30 @@ class VoiceDesignRequest(BaseModel):
     instruct: str = Field(..., min_length=1, description="Natural-language voice description")
 
 
+class S2ProRequest(BaseModel):
+    """Request payload for Fish Audio S2 Pro plain TTS."""
+
+    text: str = Field(..., min_length=1, max_length=5000)
+    language: Optional[str] = Field(default=None, description="e.g. English, Chinese, Auto")
+
+    @validator("language", pre=True)
+    def _map_short_language_codes(cls, v: Optional[str]) -> Optional[str]:
+        if not v:
+            return v
+        mapping = {
+            "en": "english",
+            "eng": "english",
+            "zh": "chinese",
+            "cn": "chinese",
+            "ja": "japanese",
+            "jp": "japanese",
+            "ko": "korean",
+            "kr": "korean",
+        }
+        key = str(v).strip().lower()
+        return mapping.get(key, v)
+
+
 class CandidateScore(BaseModel):
     """Scoring metrics for a single candidate."""
 

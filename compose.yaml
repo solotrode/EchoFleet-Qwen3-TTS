@@ -187,7 +187,7 @@ services:
       start-sglang-s2pro serve
       --model-path fishaudio/s2-pro
       --config /app/sglang-omni/examples/configs/s2pro_tts.yaml
-      --stages.2.executor.args.device cuda
+      --stages.2.executor.args.device cpu
       --port 8000
     networks:
       - echofleet-qwen3-network
