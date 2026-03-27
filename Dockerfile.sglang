@@ -315,6 +315,49 @@ if old not in text:
 stages.write_text(text.replace(old, new, 1), encoding='utf-8')
 PY
 
+RUN python - <<'PY'
+from pathlib import Path
+
+stages = Path('/opt/venv/lib/python3.12/site-packages/sglang_omni/models/fishaudio_s2_pro/pipeline/stages.py')
+text = stages.read_text(encoding='utf-8')
+
+old_block = '''    def _encode_reference_audio(audio_path: str, device: str = "cpu") -> torch.Tensor:
+        import torchaudio
+
+        audio, sr = torchaudio.load(audio_path)
+        if audio.shape[0] > 1:
+            audio = audio.mean(0, keepdim=True)
+        audio = torchaudio.functional.resample(audio, sr, codec.sample_rate)'''
+
+new_block = '''    def _encode_reference_audio(audio_path: str, device: str = "cpu") -> torch.Tensor:
+        try:
+            import torchaudio
+            audio, sr = torchaudio.load(audio_path)
+            if audio.shape[0] > 1:
+                audio = audio.mean(0, keepdim=True)
+            audio = torchaudio.functional.resample(audio, sr, codec.sample_rate)
+        except Exception:
+            import soundfile as sf
+            import numpy as np
+            import torch
+            arr, sr = sf.read(audio_path, dtype='float32', always_2d=True)
+            audio = torch.from_numpy(arr.T)
+            if audio.shape[0] > 1:
+                audio = audio.mean(0, keepdim=True)
+            audio = torch.nn.functional.interpolate(
+                audio.unsqueeze(0).float(), 
+                scale_factor=sr / codec.sample_rate, 
+                mode='linear', 
+                align_corners=False
+            ).squeeze(0)
+            sr = codec.sample_rate'''
+
+if old_block not in text:
+    raise SystemExit('Expected _encode_reference_audio block not found in stages.py')
+text = text.replace(old_block, new_block, 1)
+stages.write_text(text, encoding='utf-8')
+PY
+
 # Set working directory
 WORKDIR /app/sglang-omni
 
