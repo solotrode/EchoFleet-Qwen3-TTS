@@ -2004,22 +2004,29 @@ async def tts_voice_design_sync(request: VoiceDesignRequest) -> AudioResponse:
     response_model=AudioResponse,
     responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
     tags=["TTS"],
-    summary="Fish Audio S2 Pro plain TTS (sync)",
+    summary="Fish Audio S2 Pro TTS (sync)",
 )
 async def tts_s2_pro_sync(request: S2ProRequest) -> AudioResponse:
-    """Synchronous plain-TTS endpoint backed by Fish Audio S2 Pro.
+    """Synchronous Fish TTS endpoint backed by Fish Audio S2 Pro.
 
-    This is intentionally narrow: accepts plain text and optional language,
-    calls a synchronous FishAudioService.generate, persists the WAV, writes a
-    minimal Redis job record, and returns an `AudioResponse` with
-    `model="s2-pro"`.
+    This endpoint accepts a flat request body with optional `ref_audio` and
+    `ref_text` fields, translates those into the upstream Fish request shape,
+    persists the WAV, writes a minimal Redis job record, and returns an
+    `AudioResponse` with `model="s2-pro"`.
     """
     try:
         svc = get_sync_fish_audio_service()
 
         # Generate waveform - run in executor to avoid blocking event loop
         loop = asyncio.get_event_loop()
-        wav, sr = await loop.run_in_executor(None, svc.generate, request.text, request.language)
+        wav, sr = await loop.run_in_executor(
+            None,
+            svc.generate,
+            request.text,
+            request.language,
+            request.ref_audio,
+            request.ref_text,
+        )
 
         # Serialize to WAV bytes
         wav_bytes = wav_to_wav_bytes(wav, int(sr))

@@ -94,10 +94,22 @@ class VoiceDesignRequest(BaseModel):
 
 
 class S2ProRequest(BaseModel):
-    """Request payload for Fish Audio S2 Pro plain TTS."""
+    """Request payload for Fish Audio S2 Pro TTS.
+
+    The API accepts a flat request body so automation tools do not need to
+    construct Fish's upstream nested `references` payload themselves.
+    """
 
     text: str = Field(..., min_length=1, max_length=5000)
     language: Optional[str] = Field(default=None, description="e.g. English, Chinese, Auto")
+    ref_audio: Optional[str] = Field(
+        default=None,
+        description="Optional reference audio path for Fish voice cloning.",
+    )
+    ref_text: Optional[str] = Field(
+        default=None,
+        description="Optional transcript for ref_audio.",
+    )
 
     @validator("language", pre=True)
     def _map_short_language_codes(cls, v: Optional[str]) -> Optional[str]:

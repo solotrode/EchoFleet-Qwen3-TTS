@@ -227,6 +227,27 @@ curl -s -X POST http://localhost:18000/v1/tts/voice-design/sync \
   -d '{"text":"Hello world","language":"en","instruct":"Bright female voice, playful"}' | jq
 ```
 
+- Fish Audio S2 Pro
+
+The API wrapper accepts a flat request body so clients like n8n do not need to
+build Fish's nested `references` structure themselves.
+
+Plain TTS:
+
+```bash
+curl -X POST http://localhost:18000/v1/tts/s2-pro/sync \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Hello world","language":"en"}'
+```
+
+Voice cloning with top-level reference fields:
+
+```bash
+curl -X POST http://localhost:18000/v1/tts/s2-pro/sync \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Hello world","language":"en","ref_audio":"voices/sample.wav","ref_text":"Reference transcript"}'
+```
+
 - Unload models (free GPU memory)
 
 Unload all models:
