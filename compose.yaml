@@ -178,6 +178,7 @@ services:
     environment:
       - CUDA_DEVICE_ORDER=PCI_BUS_ID
       - HF_TOKEN=${HUGGINGFACE_HUB_TOKEN}
+      - FISH_FORCE_SDPA_KVCACHE=true
     ports:
       - "18001:8000"  # SGLang API on port 8001
     volumes:
