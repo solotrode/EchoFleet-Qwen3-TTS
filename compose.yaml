@@ -157,6 +157,7 @@ services:
   # Build from source: https://github.com/sgl-project/sglang-omni
   # ============================================================================
   fish-sglang:
+    image: fish-sglang:local
     build:
       context: .
       dockerfile: Dockerfile.sglang
