@@ -37,7 +37,7 @@ services:
       redis:
         condition: service_healthy
       fish-sglang:
-        condition: service_healthy
+        condition: service_started
     deploy:
       resources:
         reservations:
@@ -69,9 +69,18 @@ services:
       - S2_PRO_MODEL_DIR=/models_fish-s2-pro
       - SGLANG_BASE_URL=http://fish-sglang:8000
       - FISH_REF_AUDIO_DIR=/voices
+      # Fish container lifecycle settings
+      - FISH_IDLE_UNLOAD_SECONDS=300
+      - FISH_STARTUP_TIMEOUT_SECONDS=300
+      - FISH_STOP_TIMEOUT_SECONDS=30
+      - FISH_SGLANG_CONTAINER_NAME=fish-sglang
+      - HOST_DOCKER_GID=${HOST_DOCKER_GID:-999}
+    group_add:
+      - "${HOST_DOCKER_GID:-999}"
     ports:
       - "18000:8000"  # API server
     volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
       - ./outputs:/workspace/outputs
       - ./logs:/logs
       - ./voices:/voices:ro
@@ -89,6 +98,7 @@ services:
       timeout: 10s
       retries: 3
       start_period: 120s
+    command: ["python", "-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
     networks:
       - echofleet-qwen3-network
 

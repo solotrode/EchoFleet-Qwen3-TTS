@@ -3,11 +3,12 @@
 This module provides a single Settings class and a get_settings() helper
 to load and cache configuration from environment variables or a .env file.
 """
+
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import List
-import os
 
 
 class Settings:
@@ -25,7 +26,7 @@ class Settings:
         # Model directories
         self.model_cache_dir: str = os.getenv("MODEL_CACHE_DIR", "/models")
         self.output_dir: str = os.getenv("OUTPUT_DIR", "/workspace/outputs")
-        
+
         # GPU configuration
         self.tts_gpus: str = os.getenv("TTS_GPUS", "0,1,2,3")
         # Preferred GPU is used when idle; others are used only when there are
@@ -38,12 +39,12 @@ class Settings:
         # utilize multiple GPUs.
         self.tts_worker_concurrency: int = int(os.getenv("TTS_WORKER_CONCURRENCY", "1"))
         self.gpu_memory_threshold_mb: int = int(os.getenv("GPU_MEMORY_THRESHOLD_MB", "1024"))
-        
+
         # Model variants to load
         self.enable_base_model: bool = os.getenv("ENABLE_BASE_MODEL", "true").lower() == "true"
         self.enable_custom_voice: bool = os.getenv("ENABLE_CUSTOM_VOICE", "true").lower() == "true"
         self.enable_voice_design: bool = os.getenv("ENABLE_VOICE_DESIGN", "true").lower() == "true"
-        
+
         # Model dtype and device settings
         self.default_dtype: str = os.getenv("DEFAULT_DTYPE", "bfloat16")
         self.device_map: str = os.getenv("DEVICE_MAP", "auto")
@@ -57,7 +58,7 @@ class Settings:
 
         # TTS generation controls
         self.tts_sample_rate: int = int(os.getenv("TTS_SAMPLE_RATE", "24000"))
-        
+
         # DEPRECATED: These token estimation settings are no longer used.
         # We now rely only on the model's inherent max_new_tokens from generation_config.json.
         # Keeping them for backward compatibility but they have no effect.
@@ -66,50 +67,62 @@ class Settings:
         self.tts_max_output_seconds: int = int(os.getenv("TTS_MAX_OUTPUT_SECONDS", "120"))
         self.tts_max_new_tokens: int = int(os.getenv("TTS_MAX_NEW_TOKENS", "2048"))
         self.tts_min_new_tokens: int = int(os.getenv("TTS_MIN_NEW_TOKENS", "96"))
-        
+
         # Chunking behavior for long texts: preferred max characters per chunk.
         # This is the ONLY limit we apply (along with the model's inherent max_new_tokens).
         # Splits occur at sentence boundaries; single sentences larger than this
         # value will be returned as a single chunk.
         self.tts_chunk_max_chars: int = int(os.getenv("TTS_CHUNK_MAX_CHARS", "1000"))
-        
+
         # API configuration
         self.api_host: str = os.getenv("API_HOST", "0.0.0.0")
         self.api_port: int = int(os.getenv("API_PORT", "8000"))
         self.gradio_port: int = int(os.getenv("GRADIO_PORT", "7860"))
-        
+
         # Whisper configuration
         # We use HuggingFace/Transformers Whisper models (repo IDs), but also accept
         # shorthand values like "large-v3-turbo" for convenience.
         self.whisper_model: str = os.getenv("WHISPER_MODEL", "openai/whisper-large-v3-turbo")
         self.whisper_device_pool: str = os.getenv("WHISPER_DEVICE_POOL", "0,1,2,3")
         # Local path where Whisper models may be pre-downloaded (e.g. mounted volume)
-        self.whisper_model_path: str = os.getenv("WHISPER_MODEL_PATH", "/stt_models/whisper-large-v3-turbo")
-        
+        self.whisper_model_path: str = os.getenv(
+            "WHISPER_MODEL_PATH", "/stt_models/whisper-large-v3-turbo"
+        )
+
         # Job processing limits
         self.max_text_length: int = int(os.getenv("MAX_TEXT_LENGTH", "5000"))
         self.max_candidates: int = int(os.getenv("MAX_CANDIDATES", "10"))
         self.default_candidates: int = int(os.getenv("DEFAULT_CANDIDATES", "1"))
         self.job_timeout: int = int(os.getenv("JOB_TIMEOUT", "3600"))
-        self.tts_candidate_stale_seconds: int = int(
-            os.getenv("TTS_CANDIDATE_STALE_SECONDS", "900")
-        )
+        self.tts_candidate_stale_seconds: int = int(os.getenv("TTS_CANDIDATE_STALE_SECONDS", "900"))
         self.tts_candidate_rescue_attempts: int = int(
             os.getenv("TTS_CANDIDATE_RESCUE_ATTEMPTS", "2")
         )
-        
+
         # Cleanup and retention
         self.retention_hours: int = int(os.getenv("RETENTION_HOURS", "24"))
         self.cleanup_schedule: str = os.getenv("CLEANUP_SCHEDULE", "0:00")
         # Unload models from GPU after a period of inactivity (seconds)
         self.tts_unload_idle_seconds: int = int(os.getenv("TTS_UNLOAD_IDLE_SECONDS", "300"))
+        # Fish Audio specific idle unload (Fish container lifecycle)
+        self.fish_idle_unload_seconds: int = int(os.getenv("FISH_IDLE_UNLOAD_SECONDS", "300"))
+        # Fish SGLang container lifecycle settings
+        self.fish_sglang_container_name: str = os.getenv(
+            "FISH_SGLANG_CONTAINER_NAME", "fish-sglang"
+        )
+        self.fish_startup_timeout_seconds: int = int(
+            os.getenv("FISH_STARTUP_TIMEOUT_SECONDS", "300")
+        )
+        self.fish_stop_timeout_seconds: int = int(os.getenv("FISH_STOP_TIMEOUT_SECONDS", "30"))
+        # Docker socket path (defaults to standard location)
+        self.fish_docker_socket_path: str = os.getenv("DOCKER_SOCK_PATH", "/var/run/docker.sock")
 
         # Retention policies (days)
         # - log_retention_days controls how long rotated log files are kept under /logs.
         # - job_artifact_retention_days controls how long per-job artifacts under OUTPUT_DIR are kept.
         self.log_retention_days: int = int(os.getenv("LOG_RETENTION_DAYS", "10"))
         self.job_artifact_retention_days: int = int(os.getenv("JOB_ARTIFACT_RETENTION_DAYS", "10"))
-        
+
         # Logging
         self.log_level: str = os.getenv("LOG_LEVEL", "INFO")
         self.structured_logging: bool = os.getenv("STRUCTURED_LOGGING", "true").lower() == "true"
@@ -130,7 +143,7 @@ class Settings:
 
     def tts_gpu_list(self) -> List[int]:
         """Return TTS GPUs as a list of ints.
-        
+
         Example:
             >>> settings.tts_gpus = "0,1,2,3"
             >>> settings.tts_gpu_list()
@@ -141,10 +154,10 @@ class Settings:
             return [int(p) for p in parts]
         except Exception:
             return [0, 1, 2, 3]
-    
+
     def whisper_device_list(self) -> List[str]:
         """Return Whisper devices as a list of CUDA device strings.
-        
+
         Example:
             >>> settings.whisper_device_pool = "0,1,2,3"
             >>> settings.whisper_device_list()
@@ -184,7 +197,7 @@ class Settings:
 
         This is intended to point at a mounted volume like `/stt_models/whisper-large-v3-turbo`.
         """
-        return (self.whisper_model_path or "/stt_models/whisper-large-v3-turbo")
+        return self.whisper_model_path or "/stt_models/whisper-large-v3-turbo"
 
 
 @lru_cache(maxsize=1)
@@ -192,7 +205,7 @@ def get_settings() -> Settings:
     """Return a cached Settings instance.
 
     Use this helper across modules to avoid repeated environment parsing.
-    
+
     Example:
         >>> from config.settings import get_settings
         >>> settings = get_settings()

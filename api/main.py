@@ -3,31 +3,33 @@
 This module provides the main FastAPI application with health check
 and placeholder endpoints. Full TTS endpoints will be added in Phase 4.
 """
+
+from __future__ import annotations
+
 import asyncio
 import base64
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from typing import Any, Dict
+import shutil
 import sys
-from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
-import shutil
+from typing import Any, Dict, Optional
 
-from utils.logging import get_logger
-from config.settings import get_settings
-from api.schemas import (
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+
+from api.schemas import (  # Keep S2ProRequest local to the module that needs it; add import here so the; schema isn't imported at package import time unnecessarily.
     AudioResponse,
-    # Keep S2ProRequest local to the module that needs it; add import here so the
-    # schema isn't imported at package import time unnecessarily.
     CustomVoiceRequest,
     EnhancedAudioResponse,
     ErrorResponse,
     JobSubmitResponse,
+    S2ProRequest,
     VoiceCloneRequest,
     VoiceDesignRequest,
 )
-from api.schemas import S2ProRequest
+from config.settings import get_settings
+from utils.logging import get_logger
+
 # Lazy-import friendly fallbacks: importing heavy inference modules at import
 # time causes test collection and lightweight imports to fail when optional
 # dependencies are missing. Provide graceful fallbacks so the module can be
@@ -40,6 +42,7 @@ except Exception:
 
     def wav_to_wav_bytes(wav, sr):
         raise RuntimeError("inference.qwen_tts_service not available in this environment")
+
 
 try:
     from inference.accuracy_scorer import AccuracyScorer
@@ -54,16 +57,19 @@ except Exception:
     class WhisperTranscription:  # minimal stub used for isinstance checks
         def __init__(self, text: str = ""):
             self.text = text
-from fastapi import Request
-from fastapi.responses import JSONResponse, FileResponse, Response
-import os
-import uuid
+
+
+import gc
 import json
-from redis import Redis
+import os
 import threading
 import time
-import gc
+import uuid
+
 import torch
+from fastapi import Request
+from fastapi.responses import FileResponse, JSONResponse, Response
+from redis import Redis
 
 logger = get_logger(__name__)
 settings = get_settings()
@@ -71,7 +77,6 @@ settings = get_settings()
 # This avoids sharing state between processes.
 # tts_server = QwenTTSServer(settings)
 redis_client = Redis(host=settings.redis_host, port=settings.redis_port, decode_responses=True)
-
 
 
 _SYNC_TTS_SERVER: Optional[QwenTTSServer] = None
@@ -226,10 +231,56 @@ def get_sync_fish_audio_service():
     return _SYNC_FISH_AUDIO_SERVICE
 
 
+# Fish SGLang container controller singleton
+_FISH_SGLANG_CONTROLLER = None
+_FISH_SGLANG_CONTROLLER_LOCK = threading.Lock()
+
+
+def get_fish_sglang_controller():
+    """Return a singleton FishSGLangController for managing the fish-sglang container.
+
+    This lazily imports the controller so the API can boot without Docker SDK
+    if the socket is not available.
+    """
+    global _FISH_SGLANG_CONTROLLER
+    if _FISH_SGLANG_CONTROLLER is None:
+        with _FISH_SGLANG_CONTROLLER_LOCK:
+            if _FISH_SGLANG_CONTROLLER is None:
+                try:
+                    import docker as _docker
+                    from docker.errors import DockerException as _DockerException
+
+                    from inference.fish_sglang_controller import FishSGLangController
+
+                    controller = FishSGLangController(
+                        container_name=settings.fish_sglang_container_name,
+                        startup_timeout_seconds=settings.fish_startup_timeout_seconds,
+                        stop_timeout_seconds=settings.fish_stop_timeout_seconds,
+                        docker_socket_path=settings.fish_docker_socket_path,
+                    )
+
+                    try:
+                        controller._docker.ping()
+                        logger.info("Fish container controller: Docker API reachable")
+                    except _DockerException as e:
+                        logger.error(
+                            "Fish container controller: Docker API unreachable — "
+                            "Fish lazy-start will fail until socket access is fixed",
+                            extra={"error": str(e)},
+                        )
+
+                    _FISH_SGLANG_CONTROLLER = controller
+                except ImportError:
+                    logger.warning("FishSGLangController not available (docker SDK may be missing)")
+                except Exception as e:
+                    logger.exception("Failed to initialize FishSGLangController: %s", e)
+    return _FISH_SGLANG_CONTROLLER
+
+
 def _run_fish_idle_watcher() -> None:
     """Unload the sync Fish backend after the configured idle timeout."""
     poll_interval = 5.0
-    idle_unload_seconds = int(getattr(settings, "tts_unload_idle_seconds", 300))
+    idle_unload_seconds = settings.fish_idle_unload_seconds
 
     while not _FISH_IDLE_WATCHER_STOP.wait(timeout=poll_interval):
         if idle_unload_seconds <= 0:
@@ -291,9 +342,15 @@ def _generate_candidate(
                     os.fsync(f.fileno())
                 except Exception:
                     # Best-effort flush; don't treat as generation failure
-                    logger.warning("Failed to fsync candidate file", extra={"job_id": job_id, "candidate_id": candidate_id, "path": wav_path})
+                    logger.warning(
+                        "Failed to fsync candidate file",
+                        extra={"job_id": job_id, "candidate_id": candidate_id, "path": wav_path},
+                    )
 
-            logger.info("candidate_saved", extra={"job_id": job_id, "candidate_id": candidate_id, "wav_path": wav_path})
+            logger.info(
+                "candidate_saved",
+                extra={"job_id": job_id, "candidate_id": candidate_id, "wav_path": wav_path},
+            )
 
             audio_b64 = base64.b64encode(wav_bytes).decode("utf-8")
             duration = float(len(wav) / sr) if hasattr(wav, "__len__") else 0.0
@@ -301,7 +358,7 @@ def _generate_candidate(
             if attempt > 0:
                 logger.info(
                     f"Candidate {candidate_id} succeeded after {attempt} retries",
-                    extra={"job_id": job_id, "candidate_id": candidate_id, "attempt": attempt}
+                    extra={"job_id": job_id, "candidate_id": candidate_id, "attempt": attempt},
                 )
 
             result = {
@@ -330,7 +387,7 @@ def _generate_candidate(
             if "size of tensor" in error_msg and "must match" in error_msg:
                 logger.warning(
                     f"Candidate {candidate_id} failed with tensor size mismatch (attempt {attempt + 1}/{max_retries + 1})",
-                    extra={"job_id": job_id, "candidate_id": candidate_id, "error": error_msg}
+                    extra={"job_id": job_id, "candidate_id": candidate_id, "error": error_msg},
                 )
                 if attempt < max_retries:
                     # Small delay before retry
@@ -341,7 +398,9 @@ def _generate_candidate(
                 break
         except Exception as e:
             last_error = str(e)
-            logger.exception(f"Candidate {candidate_id} generation failed (attempt {attempt + 1}/{max_retries + 1})")
+            logger.exception(
+                f"Candidate {candidate_id} generation failed (attempt {attempt + 1}/{max_retries + 1})"
+            )
             if attempt < max_retries:
                 time.sleep(0.5 * (attempt + 1))
                 continue
@@ -349,7 +408,7 @@ def _generate_candidate(
 
     logger.error(
         f"Candidate {candidate_id} failed after all retries",
-        extra={"job_id": job_id, "candidate_id": candidate_id, "last_error": last_error}
+        extra={"job_id": job_id, "candidate_id": candidate_id, "last_error": last_error},
     )
     return None
 
@@ -414,9 +473,11 @@ def _score_candidates(job_id: str, candidates: list[Dict[str, Any]], job: Dict[s
             trans_text = (
                 transcription.text
                 if isinstance(transcription, WhisperTranscription)
-                else transcription.get("text", "")
-                if isinstance(transcription, dict)
-                else str(transcription)
+                else (
+                    transcription.get("text", "")
+                    if isinstance(transcription, dict)
+                    else str(transcription)
+                )
             )
             duration = cand.get("duration_seconds", 0.0)
             score = scorer.score_candidate(
@@ -424,19 +485,23 @@ def _score_candidates(job_id: str, candidates: list[Dict[str, Any]], job: Dict[s
                 transcription=trans_text,
                 duration=duration,
             )
-            scored.append({
-                "candidate_id": cand["candidate_id"],
-                "wav_path": cand["wav_path"],
-                "audio_base64": cand["audio_base64"],
-                "sample_rate": cand["sample_rate"],
-                "duration_seconds": duration,
-                "tts_gpu": cand.get("tts_gpu"),
-                "timings": cand.get("timings", {}),
-                "stt_device": dev,
-                "score": score,
-            })
+            scored.append(
+                {
+                    "candidate_id": cand["candidate_id"],
+                    "wav_path": cand["wav_path"],
+                    "audio_base64": cand["audio_base64"],
+                    "sample_rate": cand["sample_rate"],
+                    "duration_seconds": duration,
+                    "tts_gpu": cand.get("tts_gpu"),
+                    "timings": cand.get("timings", {}),
+                    "stt_device": dev,
+                    "score": score,
+                }
+            )
         except Exception:
-            logger.exception("Transcription/scoring failed for candidate %s", cand.get("candidate_id"))
+            logger.exception(
+                "Transcription/scoring failed for candidate %s", cand.get("candidate_id")
+            )
 
     if not scored:
         raise RuntimeError("All transcriptions failed")
@@ -447,7 +512,10 @@ def _score_candidates(job_id: str, candidates: list[Dict[str, Any]], job: Dict[s
             transcriber.unload()
             logger.info("Whisper model unloaded", extra={"device": dev, "job_id": job_id})
         except Exception as exc:
-            logger.warning("Failed to unload Whisper", extra={"device": dev, "job_id": job_id, "error": str(exc)})
+            logger.warning(
+                "Failed to unload Whisper",
+                extra={"device": dev, "job_id": job_id, "error": str(exc)},
+            )
 
     scored.sort(
         key=lambda c: (
@@ -493,7 +561,9 @@ def _score_candidates(job_id: str, candidates: list[Dict[str, Any]], job: Dict[s
             "wav_path": best.get("wav_path"),
             "download_url": f"/v1/audio/{job_id}.wav",
             "best_candidate": json.dumps(best.get("score")),
-            "all_candidates": json.dumps(scored) if bool(job.get("return_all_candidates", False)) else "",
+            "all_candidates": (
+                json.dumps(scored) if bool(job.get("return_all_candidates", False)) else ""
+            ),
             "num_candidates_generated": len(scored),
             "winner_candidate_id": str(best.get("candidate_id")),
             "result_path": result_path,
@@ -580,9 +650,13 @@ def _enqueue_voice_clone_job(request: VoiceCloneRequest) -> JobSubmitResponse:
     """
     if not request.x_vector_only_mode:
         if not request.ref_audio or not str(request.ref_audio).strip():
-            raise ValueError("ref_audio is required for voice cloning unless x_vector_only_mode=True")
+            raise ValueError(
+                "ref_audio is required for voice cloning unless x_vector_only_mode=True"
+            )
         if not request.ref_text or not str(request.ref_text).strip():
-            raise ValueError("ref_text is required for voice cloning unless x_vector_only_mode=True")
+            raise ValueError(
+                "ref_text is required for voice cloning unless x_vector_only_mode=True"
+            )
 
     job_id = uuid.uuid4().hex
     payload = {
@@ -647,6 +721,7 @@ def _enqueue_voice_design_job(request: "VoiceDesignRequest") -> JobSubmitRespons
         status="queued",
     )
 
+
 app = FastAPI(
     title="Qwen3-TTS Multi-GPU API",
     description="Multi-model text-to-speech API with voice cloning, custom voices, and voice design",
@@ -680,6 +755,7 @@ async def limit_request_size(request: Request, call_next):
     # Store body back onto the request so downstream can read it
     request._body = body
     return await call_next(request)
+
 
 # CORS middleware
 app.add_middleware(
@@ -753,7 +829,7 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
     )
 
     last_job_time = time.time()
-    idle_unload_seconds = int(getattr(settings, "tts_unload_idle_seconds", 300))
+    idle_unload_seconds = settings.fish_idle_unload_seconds
 
     while True:
         try:
@@ -769,7 +845,11 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                         if unloaded:
                             logger.info(
                                 "Unloaded idle models",
-                                extra={"worker_id": worker_id, "device": device, "unloaded": unloaded},
+                                extra={
+                                    "worker_id": worker_id,
+                                    "device": device,
+                                    "unloaded": unloaded,
+                                },
                             )
                     except Exception as e:
                         logger.warning(f"Failed to unload idle models: {e}")
@@ -790,7 +870,9 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
 
                     if cmd_type == "unload":
                         model_type = cmd.get("model_type")
-                        logger.info(f"Worker received unload command: {cmd_id}, model_type={model_type}")
+                        logger.info(
+                            f"Worker received unload command: {cmd_id}, model_type={model_type}"
+                        )
                         unloaded = tts_server.unload_model(model_type)
                         redis_client.hset(
                             f"tts:cmd:{cmd_id}",
@@ -798,7 +880,7 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                                 "status": "done",
                                 "result": json.dumps(unloaded),
                                 "completed_at": str(time.time()),
-                            }
+                            },
                         )
                         redis_client.expire(f"tts:cmd:{cmd_id}", 60)
                         logger.info(f"Worker unload complete: {unloaded}")
@@ -806,8 +888,7 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                     logger.exception("Failed to process command")
                     if cmd_id:
                         redis_client.hset(
-                            f"tts:cmd:{cmd_id}",
-                            mapping={"status": "error", "error": str(e)}
+                            f"tts:cmd:{cmd_id}", mapping={"status": "error", "error": str(e)}
                         )
                 continue
 
@@ -912,7 +993,9 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                     try:
                         candidates.append(json.loads(item_json))
                     except Exception:
-                        logger.warning("Failed to decode candidate payload", extra={"job_id": job_id})
+                        logger.warning(
+                            "Failed to decode candidate payload", extra={"job_id": job_id}
+                        )
 
                 if not candidates:
                     redis_client.hset(
@@ -940,8 +1023,8 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                     "job_id": job_id,
                     "text_len": len(job_text),
                     "text_start": job_text[:200] if job_text else "",
-                    "text_end": job_text[-200:] if len(job_text) > 200 else job_text
-                }
+                    "text_end": job_text[-200:] if len(job_text) > 200 else job_text,
+                },
             )
 
             key = f"tts:job:{job_id}"
@@ -975,7 +1058,10 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                         out_path = os.path.join(out_dir, f"{job_id}.wav")
                         with open(out_path, "wb") as f:
                             f.write(wav_bytes)
-                        logger.info("Wrote generated WAV to disk", extra={"job_id": job_id, "path": out_path})
+                        logger.info(
+                            "Wrote generated WAV to disk",
+                            extra={"job_id": job_id, "path": out_path},
+                        )
                         timings["postprocess_write_wav_at"] = time.time()
                     except Exception:
                         logger.warning("Failed to write WAV to disk", exc_info=True)
@@ -998,7 +1084,9 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                                     "candidate_id": 0,
                                     "wav_path": out_path,
                                     "sample_rate": sr,
-                                    "duration_seconds": float(len(wav) / sr) if hasattr(wav, "__len__") else 0.0,
+                                    "duration_seconds": (
+                                        float(len(wav) / sr) if hasattr(wav, "__len__") else 0.0
+                                    ),
                                     "score": None,
                                 }
                             ],
@@ -1015,17 +1103,20 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                     duration = float(len(wav) / sr) if hasattr(wav, "__len__") else 0.0
                     download_url = f"/v1/audio/{job_id}.wav"
                     timings["completed_at"] = time.time()
-                    redis_client.hset(key, mapping={
-                        "status": "done",
-                        "audio_base64": audio_b64,
-                        "sample_rate": sr,
-                        "duration_seconds": duration,
-                        "wav_path": out_path if 'out_path' in locals() else "",
-                        "result_path": result_path,
-                        "download_url": download_url,
-                        "completed_at": str(time.time()),
-                        "timings": json.dumps(timings),
-                    })
+                    redis_client.hset(
+                        key,
+                        mapping={
+                            "status": "done",
+                            "audio_base64": audio_b64,
+                            "sample_rate": sr,
+                            "duration_seconds": duration,
+                            "wav_path": out_path if "out_path" in locals() else "",
+                            "result_path": result_path,
+                            "download_url": download_url,
+                            "completed_at": str(time.time()),
+                            "timings": json.dumps(timings),
+                        },
+                    )
                     continue
 
                 # Single-candidate path
@@ -1047,7 +1138,10 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                         out_path = os.path.join(out_dir, f"{job_id}.wav")
                         with open(out_path, "wb") as f:
                             f.write(wav_bytes)
-                        logger.info("Wrote generated WAV to disk", extra={"job_id": job_id, "path": out_path})
+                        logger.info(
+                            "Wrote generated WAV to disk",
+                            extra={"job_id": job_id, "path": out_path},
+                        )
                     except Exception:
                         logger.warning("Failed to write WAV to disk", exc_info=True)
 
@@ -1063,7 +1157,9 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                                     "candidate_id": 0,
                                     "wav_path": out_path,
                                     "sample_rate": sr,
-                                    "duration_seconds": float(len(wav) / sr) if hasattr(wav, "__len__") else 0.0,
+                                    "duration_seconds": (
+                                        float(len(wav) / sr) if hasattr(wav, "__len__") else 0.0
+                                    ),
                                     "score": None,
                                 }
                             ],
@@ -1079,19 +1175,24 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                     audio_b64 = base64.b64encode(wav_bytes).decode("utf-8")
                     duration = float(len(wav) / sr) if hasattr(wav, "__len__") else 0.0
                     download_url = f"/v1/audio/{job_id}.wav"
-                    timings["postprocess_write_wav_at"] = timings.get("postprocess_write_wav_at", time.time())
+                    timings["postprocess_write_wav_at"] = timings.get(
+                        "postprocess_write_wav_at", time.time()
+                    )
                     timings["completed_at"] = time.time()
-                    redis_client.hset(key, mapping={
-                        "status": "done",
-                        "audio_base64": audio_b64,
-                        "sample_rate": sr,
-                        "duration_seconds": duration,
-                        "wav_path": out_path if 'out_path' in locals() else "",
-                        "result_path": result_path,
-                        "download_url": download_url,
-                        "completed_at": str(time.time()),
-                        "timings": json.dumps(timings),
-                    })
+                    redis_client.hset(
+                        key,
+                        mapping={
+                            "status": "done",
+                            "audio_base64": audio_b64,
+                            "sample_rate": sr,
+                            "duration_seconds": duration,
+                            "wav_path": out_path if "out_path" in locals() else "",
+                            "result_path": result_path,
+                            "download_url": download_url,
+                            "completed_at": str(time.time()),
+                            "timings": json.dumps(timings),
+                        },
+                    )
                 else:
                     # Multi-candidate generation
                     candidates = []
@@ -1103,17 +1204,19 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                     timings["generation_start"] = time.time()
                     # Spawn generation tasks
                     for i in range(num_candidates):
-                        futures.append(executor.submit(
-                            _generate_candidate,
-                            tts_server,
-                            job.get("text"),
-                            job.get("language"),
-                            job.get("ref_audio"),
-                            job.get("ref_text"),
-                            job.get("x_vector_only_mode", False),
-                            job_id,
-                            i,
-                        ))
+                        futures.append(
+                            executor.submit(
+                                _generate_candidate,
+                                tts_server,
+                                job.get("text"),
+                                job.get("language"),
+                                job.get("ref_audio"),
+                                job.get("ref_text"),
+                                job.get("x_vector_only_mode", False),
+                                job_id,
+                                i,
+                            )
+                        )
 
                     gen_timeout = None
                     if float(getattr(settings, "job_timeout", 0) or 0) > 0:
@@ -1141,7 +1244,7 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                     timings["generation_end"] = time.time()
                     if not candidates:
                         raise RuntimeError("All candidates failed to generate")
-                    
+
                     # Unload Qwen TTS models BEFORE loading Whisper only when
                     # there are no additional jobs queued. Deferring unload while
                     # jobs remain prevents repeated unload/load cycles during
@@ -1151,7 +1254,10 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                         try:
                             queued_jobs = redis_client.llen("tts:jobs")
                         except Exception:
-                            logger.exception("Failed to check queued jobs; proceeding with unload check", extra={"job_id": job_id})
+                            logger.exception(
+                                "Failed to check queued jobs; proceeding with unload check",
+                                extra={"job_id": job_id},
+                            )
 
                         if queued_jobs > 0:
                             logger.info(
@@ -1161,18 +1267,24 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                             unloaded_models = []
                         else:
                             # No queued jobs — safe to unload before loading Whisper
-                            logger.info("Unloading Qwen TTS models before Whisper loading", extra={"job_id": job_id})
+                            logger.info(
+                                "Unloading Qwen TTS models before Whisper loading",
+                                extra={"job_id": job_id},
+                            )
                             unloaded_models = tts_server.unload_model(model_type=None)
                             logger.info(
                                 "Qwen TTS models unloaded",
-                                extra={"job_id": job_id, "unloaded_count": len(unloaded_models)}
+                                extra={"job_id": job_id, "unloaded_count": len(unloaded_models)},
                             )
                     except Exception as e:
                         logger.warning(f"Failed to unload TTS models: {e}", exc_info=True)
-                    
+
                     # Additional GPU memory cleanup after model unload
                     if torch.cuda.is_available():
-                        logger.info("Performing GPU memory cleanup after TTS unload", extra={"job_id": job_id})
+                        logger.info(
+                            "Performing GPU memory cleanup after TTS unload",
+                            extra={"job_id": job_id},
+                        )
                         for device_id in range(torch.cuda.device_count()):
                             with torch.cuda.device(device_id):
                                 torch.cuda.synchronize()
@@ -1189,7 +1301,9 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                     transcribers = {}
                     for dev in stt_devices:
                         try:
-                            transcribers[dev] = WhisperTranscriberHF(settings.whisper_model_id(), device=dev)
+                            transcribers[dev] = WhisperTranscriberHF(
+                                settings.whisper_model_id(), device=dev
+                            )
                         except Exception:
                             logger.exception("Failed to init transcriber on %s", dev)
 
@@ -1199,11 +1313,13 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                         dev = stt_devices[cand["candidate_id"] % max(1, len(stt_devices))]
                         trans = transcribers.get(dev)
                         if trans:
-                            stt_futures.append((cand, executor.submit(trans.transcribe, cand["wav_path"]), dev))
+                            stt_futures.append(
+                                (cand, executor.submit(trans.transcribe, cand["wav_path"]), dev)
+                            )
 
                     scored = []
                     timings["scoring_start"] = time.time()
-                    
+
                     # Log reference text for comparison
                     ref_text = job.get("text", "")
                     logger.info(
@@ -1211,28 +1327,42 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                         extra={
                             "job_id": job_id,
                             "reference_text_len": len(ref_text),
-                            "reference_text": ref_text
-                        }
+                            "reference_text": ref_text,
+                        },
                     )
-                    
+
                     for cand, sf, dev in stt_futures:
                         try:
                             transcription = sf.result(timeout=120)
                             # transcription may be WhisperTranscription or dict
-                            trans_text = transcription.text if isinstance(transcription, WhisperTranscription) else transcription.get("text", "") if isinstance(transcription, dict) else str(transcription)
+                            trans_text = (
+                                transcription.text
+                                if isinstance(transcription, WhisperTranscription)
+                                else (
+                                    transcription.get("text", "")
+                                    if isinstance(transcription, dict)
+                                    else str(transcription)
+                                )
+                            )
                             duration = cand.get("duration_seconds", 0.0)
-                            score = scorer.score_candidate(reference=job.get("text"), transcription=trans_text, duration=duration)
-                            scored.append({
-                                "candidate_id": cand["candidate_id"],
-                                "wav_path": cand["wav_path"],
-                                "audio_base64": cand["audio_base64"],
-                                "sample_rate": cand["sample_rate"],
-                                "duration_seconds": duration,
-                                "tts_gpu": cand.get("tts_gpu", None),
-                                "timings": cand.get("timings", {}),
-                                "stt_device": dev,
-                                "score": score,
-                            })
+                            score = scorer.score_candidate(
+                                reference=job.get("text"),
+                                transcription=trans_text,
+                                duration=duration,
+                            )
+                            scored.append(
+                                {
+                                    "candidate_id": cand["candidate_id"],
+                                    "wav_path": cand["wav_path"],
+                                    "audio_base64": cand["audio_base64"],
+                                    "sample_rate": cand["sample_rate"],
+                                    "duration_seconds": duration,
+                                    "tts_gpu": cand.get("tts_gpu", None),
+                                    "timings": cand.get("timings", {}),
+                                    "stt_device": dev,
+                                    "score": score,
+                                }
+                            )
 
                             logger.info(
                                 "Candidate scored",
@@ -1244,7 +1374,7 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                                     "score": _score_for_audit_log(score),
                                 },
                             )
-                            
+
                             # Log full transcribed text for diagnosis
                             logger.info(
                                 "Candidate transcription",
@@ -1253,29 +1383,34 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                                     "candidate_id": cand.get("candidate_id"),
                                     "transcribed_text_len": len(trans_text),
                                     "transcribed_text": trans_text,
-                                    "audio_duration_sec": duration
-                                }
+                                    "audio_duration_sec": duration,
+                                },
                             )
                         except Exception:
-                            logger.exception("Transcription/scoring failed for candidate %s", cand.get("candidate_id"))
+                            logger.exception(
+                                "Transcription/scoring failed for candidate %s",
+                                cand.get("candidate_id"),
+                            )
 
                     timings["scoring_end"] = time.time()
                     if not scored:
                         raise RuntimeError("All transcriptions failed")
-                    
+
                     # CRITICAL: Unload Whisper models immediately after scoring completes
                     # This frees GPU memory before final job processing
                     logger.info("Unloading Whisper models after scoring", extra={"job_id": job_id})
                     for dev, transcriber in transcribers.items():
                         try:
                             transcriber.unload()
-                            logger.info(f"Whisper model unloaded from {dev}", extra={"job_id": job_id})
+                            logger.info(
+                                f"Whisper model unloaded from {dev}", extra={"job_id": job_id}
+                            )
                         except Exception as e:
                             logger.warning(f"Failed to unload Whisper from {dev}: {e}")
-                    
+
                     # Clear transcriber references
                     transcribers.clear()
-                    
+
                     # Additional GPU memory cleanup after Whisper unload
                     if torch.cuda.is_available():
                         logger.info("GPU cleanup after Whisper unload", extra={"job_id": job_id})
@@ -1346,25 +1481,31 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
                         )
                     except Exception:
                         logger.warning("Failed to write per-job result summary", exc_info=True)
-                    redis_client.hset(key, mapping={
-                        "status": "done",
-                        "audio_base64": audio_b64,
-                        "sample_rate": best.get("sample_rate"),
-                        "duration_seconds": best.get("duration_seconds"),
-                        "wav_path": out_path,
-                        "download_url": download_url,
-                        "best_candidate": json.dumps(best.get("score")),
-                        "all_candidates": json.dumps(scored) if return_all else "",
-                        "num_candidates_generated": len(scored),
-                        "winner_candidate_id": str(best.get("candidate_id")),
-                        "result_path": result_path,
-                        "completed_at": str(time.time()),
-                    })
-                
+                    redis_client.hset(
+                        key,
+                        mapping={
+                            "status": "done",
+                            "audio_base64": audio_b64,
+                            "sample_rate": best.get("sample_rate"),
+                            "duration_seconds": best.get("duration_seconds"),
+                            "wav_path": out_path,
+                            "download_url": download_url,
+                            "best_candidate": json.dumps(best.get("score")),
+                            "all_candidates": json.dumps(scored) if return_all else "",
+                            "num_candidates_generated": len(scored),
+                            "winner_candidate_id": str(best.get("candidate_id")),
+                            "result_path": result_path,
+                            "completed_at": str(time.time()),
+                        },
+                    )
+
                 # CRITICAL: Free all GPU memory after job completes
                 # This prevents VRAM accumulation across sequential jobs
                 if torch.cuda.is_available():
-                    logger.info("Performing aggressive GPU memory cleanup after job completion", extra={"job_id": job_id})
+                    logger.info(
+                        "Performing aggressive GPU memory cleanup after job completion",
+                        extra={"job_id": job_id},
+                    )
                     for device_id in range(torch.cuda.device_count()):
                         with torch.cuda.device(device_id):
                             torch.cuda.synchronize()
@@ -1381,8 +1522,15 @@ def job_worker_loop(worker_id: int, device: str, queue_name: str) -> None:
 
             except Exception as e:
                 logger.exception("Job failed", exc_info=e)
-                redis_client.hset(key, mapping={"status": "failed", "error": str(e)[:200], "completed_at": str(time.time())})
-                
+                redis_client.hset(
+                    key,
+                    mapping={
+                        "status": "failed",
+                        "error": str(e)[:200],
+                        "completed_at": str(time.time()),
+                    },
+                )
+
                 # Clean up GPU memory even on failure
                 if torch.cuda.is_available():
                     for device_id in range(torch.cuda.device_count()):
@@ -1469,9 +1617,13 @@ async def tts_voice_clone_sync(request: VoiceCloneRequest) -> EnhancedAudioRespo
         # Validate ref_audio early to avoid passing empty values into audio loaders
         if not request.x_vector_only_mode:
             if not request.ref_audio or not str(request.ref_audio).strip():
-                raise ValueError("ref_audio is required for voice cloning unless x_vector_only_mode=True")
+                raise ValueError(
+                    "ref_audio is required for voice cloning unless x_vector_only_mode=True"
+                )
             if not request.ref_text or not str(request.ref_text).strip():
-                raise ValueError("ref_text is required for voice cloning unless x_vector_only_mode=True")
+                raise ValueError(
+                    "ref_text is required for voice cloning unless x_vector_only_mode=True"
+                )
 
         num_candidates = int(request.num_candidates or 1)
 
@@ -1497,20 +1649,27 @@ async def tts_voice_clone_sync(request: VoiceCloneRequest) -> EnhancedAudioRespo
                 out_path = os.path.join(out_dir, f"{job_id}.wav")
                 with open(out_path, "wb") as f:
                     f.write(wav_bytes)
-                logger.info("Wrote generated WAV to disk (sync)", extra={"job_id": job_id, "path": out_path})
+                logger.info(
+                    "Wrote generated WAV to disk (sync)", extra={"job_id": job_id, "path": out_path}
+                )
             except Exception:
-                logger.warning("Failed to persist WAV to disk for synchronous request", exc_info=True)
+                logger.warning(
+                    "Failed to persist WAV to disk for synchronous request", exc_info=True
+                )
 
             download_url = f"/v1/audio/{job_id}.wav"
-            redis_client.hset(f"tts:job:{job_id}", mapping={
-                "status": "done",
-                "audio_base64": audio_b64,
-                "sample_rate": sr,
-                "duration_seconds": duration,
-                "wav_path": out_path,
-                "download_url": download_url,
-                "completed_at": str(time.time()),
-            })
+            redis_client.hset(
+                f"tts:job:{job_id}",
+                mapping={
+                    "status": "done",
+                    "audio_base64": audio_b64,
+                    "sample_rate": sr,
+                    "duration_seconds": duration,
+                    "wav_path": out_path,
+                    "download_url": download_url,
+                    "completed_at": str(time.time()),
+                },
+            )
 
             return EnhancedAudioResponse(
                 audio_base64=audio_b64,
@@ -1576,26 +1735,30 @@ async def tts_voice_clone_sync(request: VoiceCloneRequest) -> EnhancedAudioRespo
                 trans_text = (
                     transcription.text
                     if isinstance(transcription, WhisperTranscription)
-                    else transcription.get("text", "")
-                    if isinstance(transcription, dict)
-                    else str(transcription)
+                    else (
+                        transcription.get("text", "")
+                        if isinstance(transcription, dict)
+                        else str(transcription)
+                    )
                 )
                 score = scorer.score_candidate(
                     reference=request.text,
                     transcription=trans_text,
                     duration=cand.get("duration_seconds", 0.0),
                 )
-                scored.append({
-                    "candidate_id": cand["candidate_id"],
-                    "wav_path": cand["wav_path"],
-                    "audio_base64": cand["audio_base64"],
-                    "sample_rate": cand["sample_rate"],
-                    "duration_seconds": cand.get("duration_seconds", 0.0),
-                    "tts_gpu": cand.get("tts_gpu", None),
-                    "timings": cand.get("timings", {}),
-                    "stt_device": dev,
-                    "score": score,
-                })
+                scored.append(
+                    {
+                        "candidate_id": cand["candidate_id"],
+                        "wav_path": cand["wav_path"],
+                        "audio_base64": cand["audio_base64"],
+                        "sample_rate": cand["sample_rate"],
+                        "duration_seconds": cand.get("duration_seconds", 0.0),
+                        "tts_gpu": cand.get("tts_gpu", None),
+                        "timings": cand.get("timings", {}),
+                        "stt_device": dev,
+                        "score": score,
+                    }
+                )
 
                 logger.info(
                     "Candidate scored (sync)",
@@ -1608,7 +1771,9 @@ async def tts_voice_clone_sync(request: VoiceCloneRequest) -> EnhancedAudioRespo
                     },
                 )
             except Exception:
-                logger.exception("Transcription/scoring failed for candidate %s", cand.get("candidate_id"))
+                logger.exception(
+                    "Transcription/scoring failed for candidate %s", cand.get("candidate_id")
+                )
 
         if not scored:
             raise HTTPException(status_code=500, detail="All transcriptions failed")
@@ -1635,18 +1800,21 @@ async def tts_voice_clone_sync(request: VoiceCloneRequest) -> EnhancedAudioRespo
         out_path = best.get("wav_path", "")
         audio_b64 = best.get("audio_base64")
         download_url = f"/v1/audio/{job_id}.wav"
-        redis_client.hset(f"tts:job:{job_id}", mapping={
-            "status": "done",
-            "audio_base64": audio_b64,
-            "sample_rate": best.get("sample_rate"),
-            "duration_seconds": best.get("duration_seconds"),
-            "wav_path": out_path,
-            "download_url": download_url,
-            "best_candidate": json.dumps(best.get("score")),
-            "all_candidates": json.dumps(scored) if request.return_all_candidates else "",
-            "num_candidates_generated": len(scored),
-            "completed_at": str(time.time()),
-        })
+        redis_client.hset(
+            f"tts:job:{job_id}",
+            mapping={
+                "status": "done",
+                "audio_base64": audio_b64,
+                "sample_rate": best.get("sample_rate"),
+                "duration_seconds": best.get("duration_seconds"),
+                "wav_path": out_path,
+                "download_url": download_url,
+                "best_candidate": json.dumps(best.get("score")),
+                "all_candidates": json.dumps(scored) if request.return_all_candidates else "",
+                "num_candidates_generated": len(scored),
+                "completed_at": str(time.time()),
+            },
+        )
 
         return EnhancedAudioResponse(
             audio_base64=audio_b64,
@@ -1657,7 +1825,9 @@ async def tts_voice_clone_sync(request: VoiceCloneRequest) -> EnhancedAudioRespo
             job_id=job_id,
             download_url=download_url,
             best_candidate_score=best.get("score"),
-            all_candidates=[c.get("score") for c in scored] if request.return_all_candidates else None,
+            all_candidates=(
+                [c.get("score") for c in scored] if request.return_all_candidates else None
+            ),
             num_candidates_generated=len(scored),
         )
     except (ValueError, FileNotFoundError) as exc:
@@ -1674,7 +1844,9 @@ async def tts_voice_clone_sync(request: VoiceCloneRequest) -> EnhancedAudioRespo
             return type(e)(msg)
 
         masked = _masked_exc(exc)
-        logger.exception("Voice-clone request failed", exc_info=(type(exc), masked, exc.__traceback__))
+        logger.exception(
+            "Voice-clone request failed", exc_info=(type(exc), masked, exc.__traceback__)
+        )
         raise HTTPException(status_code=500, detail=f"Internal error") from exc
 
 
@@ -1731,7 +1903,11 @@ async def download_audio(job_id: str):
     if audio_b64:
         try:
             wav_bytes = base64.b64decode(audio_b64)
-            return Response(content=wav_bytes, media_type="audio/wav", headers={"Content-Disposition": f"attachment; filename={job_id}.wav"})
+            return Response(
+                content=wav_bytes,
+                media_type="audio/wav",
+                headers={"Content-Disposition": f"attachment; filename={job_id}.wav"},
+            )
         except Exception:
             raise HTTPException(status_code=500, detail="Failed to decode audio bytes")
 
@@ -1779,10 +1955,10 @@ async def unload_models(model_type: Optional[str] = None):
             "type": "unload",
             "model_type": model_type,
         }
-        
+
         logger.info(f"API sending unload command to worker: {cmd_id}")
         redis_client.rpush("tts:commands", json.dumps(cmd_payload))
-        
+
         # Wait for worker to process command (poll for result)
         timeout = 30  # seconds
         start_time = time.time()
@@ -1797,13 +1973,13 @@ async def unload_models(model_type: Optional[str] = None):
                 error = result.get("error", "Unknown error")
                 logger.error(f"Worker unload failed: {error}")
                 raise HTTPException(status_code=500, detail=f"Worker error: {error}")
-            
+
             await asyncio.sleep(0.5)
-        
+
         # Timeout
         logger.warning(f"Unload command {cmd_id} timed out")
         raise HTTPException(status_code=504, detail="Unload command timed out")
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -1829,35 +2005,65 @@ async def models_status():
                         param_device = str(next(model.parameters()).device)
                 except Exception:
                     param_device = "unknown"
-                
-                cached_models.append({
-                    "model_type": model_type,
-                    "device": device,
-                    "param_device": param_device,
-                })
+
+                cached_models.append(
+                    {
+                        "model_type": model_type,
+                        "device": device,
+                        "param_device": param_device,
+                    }
+                )
 
         fish_service = _SYNC_FISH_AUDIO_SERVICE
-        fish_status = fish_service.status() if fish_service is not None else {
-            "model_type": "s2-pro",
-            "loaded": False,
-            "backend": "remote",
-            "initialized": False,
+        fish_status = (
+            fish_service.status()
+            if fish_service is not None
+            else {
+                "model_type": "s2-pro",
+                "loaded": False,
+                "backend": "remote",
+                "initialized": False,
+            }
+        )
+
+        fish_container_state: Dict[str, Any] = {
+            "controller_available": False,
+            "container_status": "unknown",
+            "docker_available": False,
         }
-        
+        controller = get_fish_sglang_controller()
+        if controller is not None:
+            fish_container_state["controller_available"] = True
+            try:
+                docker_ok = controller._docker.ping()
+                fish_container_state["docker_available"] = docker_ok
+                if docker_ok:
+                    container_running = controller.is_running()
+                    fish_container_state["container_status"] = (
+                        "running" if container_running else "stopped"
+                    )
+            except Exception as e:
+                logger.warning("Failed to get container state: %s", e)
+                fish_container_state["container_status"] = "error"
+                fish_container_state["error"] = str(e)
+
         gpu_memory = []
         if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
                 allocated = torch.cuda.memory_allocated(i) / (1024**3)
                 reserved = torch.cuda.memory_reserved(i) / (1024**3)
-                gpu_memory.append({
-                    "gpu_id": i,
-                    "allocated_gb": round(allocated, 2),
-                    "reserved_gb": round(reserved, 2),
-                })
-        
+                gpu_memory.append(
+                    {
+                        "gpu_id": i,
+                        "allocated_gb": round(allocated, 2),
+                        "reserved_gb": round(reserved, 2),
+                    }
+                )
+
         return {
             "cached_models": cached_models,
             "fish_backend": fish_status,
+            "fish_container": fish_container_state,
             "gpu_memory": gpu_memory,
             "model_count": len(cached_models),
         }
@@ -1895,20 +2101,25 @@ async def tts_custom_voice(request: CustomVoiceRequest) -> AudioResponse:
             out_path = os.path.join(out_dir, f"{job_id}.wav")
             with open(out_path, "wb") as f:
                 f.write(wav_bytes)
-            logger.info("Wrote generated WAV to disk (sync)", extra={"job_id": job_id, "path": out_path})
+            logger.info(
+                "Wrote generated WAV to disk (sync)", extra={"job_id": job_id, "path": out_path}
+            )
         except Exception:
             logger.warning("Failed to persist WAV to disk for synchronous request", exc_info=True)
 
         download_url = f"/v1/audio/{job_id}.wav"
-        redis_client.hset(f"tts:job:{job_id}", mapping={
-            "status": "done",
-            "audio_base64": audio_b64,
-            "sample_rate": sr,
-            "duration_seconds": duration,
-            "wav_path": out_path,
-            "download_url": download_url,
-            "completed_at": str(time.time()),
-        })
+        redis_client.hset(
+            f"tts:job:{job_id}",
+            mapping={
+                "status": "done",
+                "audio_base64": audio_b64,
+                "sample_rate": sr,
+                "duration_seconds": duration,
+                "wav_path": out_path,
+                "download_url": download_url,
+                "completed_at": str(time.time()),
+            },
+        )
 
         return AudioResponse(
             audio_base64=audio_b64,
@@ -1922,6 +2133,7 @@ async def tts_custom_voice(request: CustomVoiceRequest) -> AudioResponse:
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
+
         def _masked_exc(e: Exception, max_len: int = 300) -> Exception:
             msg = str(e)
             if len(msg) > max_len:
@@ -1929,7 +2141,9 @@ async def tts_custom_voice(request: CustomVoiceRequest) -> AudioResponse:
             return type(e)(msg)
 
         masked = _masked_exc(exc)
-        logger.exception("Custom-voice request failed", exc_info=(type(exc), masked, exc.__traceback__))
+        logger.exception(
+            "Custom-voice request failed", exc_info=(type(exc), masked, exc.__traceback__)
+        )
         raise HTTPException(status_code=500, detail=f"Internal error") from exc
 
 
@@ -1961,20 +2175,25 @@ async def tts_voice_design_sync(request: VoiceDesignRequest) -> AudioResponse:
             out_path = os.path.join(out_dir, f"{job_id}.wav")
             with open(out_path, "wb") as f:
                 f.write(wav_bytes)
-            logger.info("Wrote generated WAV to disk (sync)", extra={"job_id": job_id, "path": out_path})
+            logger.info(
+                "Wrote generated WAV to disk (sync)", extra={"job_id": job_id, "path": out_path}
+            )
         except Exception:
             logger.warning("Failed to persist WAV to disk for synchronous request", exc_info=True)
 
         download_url = f"/v1/audio/{job_id}.wav"
-        redis_client.hset(f"tts:job:{job_id}", mapping={
-            "status": "done",
-            "audio_base64": audio_b64,
-            "sample_rate": sr,
-            "duration_seconds": duration,
-            "wav_path": out_path,
-            "download_url": download_url,
-            "completed_at": str(time.time()),
-        })
+        redis_client.hset(
+            f"tts:job:{job_id}",
+            mapping={
+                "status": "done",
+                "audio_base64": audio_b64,
+                "sample_rate": sr,
+                "duration_seconds": duration,
+                "wav_path": out_path,
+                "download_url": download_url,
+                "completed_at": str(time.time()),
+            },
+        )
 
         return AudioResponse(
             audio_base64=audio_b64,
@@ -1988,6 +2207,7 @@ async def tts_voice_design_sync(request: VoiceDesignRequest) -> AudioResponse:
     except (ValueError, FileNotFoundError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
+
         def _masked_exc(e: Exception, max_len: int = 300) -> Exception:
             msg = str(e)
             if len(msg) > max_len:
@@ -1995,14 +2215,20 @@ async def tts_voice_design_sync(request: VoiceDesignRequest) -> AudioResponse:
             return type(e)(msg)
 
         masked = _masked_exc(exc)
-        logger.exception("Voice-design request failed", exc_info=(type(exc), masked, exc.__traceback__))
+        logger.exception(
+            "Voice-design request failed", exc_info=(type(exc), masked, exc.__traceback__)
+        )
         raise HTTPException(status_code=500, detail=f"Internal error") from exc
 
 
 @app.post(
     "/v1/tts/s2-pro/sync",
     response_model=AudioResponse,
-    responses={400: {"model": ErrorResponse}, 500: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+    responses={
+        400: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
     tags=["TTS"],
     summary="Fish Audio S2 Pro TTS (sync)",
 )
@@ -2043,20 +2269,28 @@ async def tts_s2_pro_sync(request: S2ProRequest) -> AudioResponse:
             out_path = os.path.join(out_dir, f"{job_id}.wav")
             with open(out_path, "wb") as f:
                 f.write(wav_bytes)
-            logger.info("Wrote generated WAV to disk (s2-pro sync)", extra={"job_id": job_id, "path": out_path})
+            logger.info(
+                "Wrote generated WAV to disk (s2-pro sync)",
+                extra={"job_id": job_id, "path": out_path},
+            )
         except Exception:
-            logger.warning("Failed to persist WAV to disk for s2-pro synchronous request", exc_info=True)
+            logger.warning(
+                "Failed to persist WAV to disk for s2-pro synchronous request", exc_info=True
+            )
 
         download_url = f"/v1/audio/{job_id}.wav"
-        redis_client.hset(f"tts:job:{job_id}", mapping={
-            "status": "done",
-            "audio_base64": audio_b64,
-            "sample_rate": int(sr),
-            "duration_seconds": duration,
-            "wav_path": out_path,
-            "download_url": download_url,
-            "completed_at": str(time.time()),
-        })
+        redis_client.hset(
+            f"tts:job:{job_id}",
+            mapping={
+                "status": "done",
+                "audio_base64": audio_b64,
+                "sample_rate": int(sr),
+                "duration_seconds": duration,
+                "wav_path": out_path,
+                "download_url": download_url,
+                "completed_at": str(time.time()),
+            },
+        )
 
         return AudioResponse(
             audio_base64=audio_b64,
@@ -2102,25 +2336,24 @@ async def tts_voice_design(request: VoiceDesignRequest) -> JobSubmitResponse:
 @app.get("/v1/health")
 async def health_check() -> Dict[str, Any]:
     """Health check endpoint for container orchestration.
-    
+
     Returns:
         Health status with system information.
     """
     import torch
-    
+
     try:
         # Check Redis connectivity
         from redis import Redis
+
         redis_conn = Redis(
-            host=settings.redis_host,
-            port=settings.redis_port,
-            socket_connect_timeout=2
+            host=settings.redis_host, port=settings.redis_port, socket_connect_timeout=2
         )
         redis_healthy = redis_conn.ping()
     except Exception as e:
         logger.warning(f"Redis health check failed: {e}")
         redis_healthy = False
-    
+
     return {
         "status": "healthy" if redis_healthy else "degraded",
         "redis": "connected" if redis_healthy else "disconnected",
@@ -2133,10 +2366,10 @@ async def health_check() -> Dict[str, Any]:
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(
         app,
         host=settings.api_host,
         port=settings.api_port,
         log_level=settings.log_level.lower(),
     )
-

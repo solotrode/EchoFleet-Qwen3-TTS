@@ -71,6 +71,9 @@ whisper-normalizer==0.1.12
 # Scheduling (for cleanup tasks)
 apscheduler==3.10.4
 
+# Docker SDK for container lifecycle management
+docker>=7.0.0
+
 
 # Development Dependencies (optional, for development only)
 pytest>=7.4.0
