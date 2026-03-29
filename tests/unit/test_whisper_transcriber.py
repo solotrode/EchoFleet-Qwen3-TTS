@@ -25,8 +25,14 @@ def dummy_pipeline(task, model, tokenizer, feature_extractor, device):
 @pytest.fixture(autouse=True)
 def patch_hf(monkeypatch):
     # Patch HF constructors used by WhisperTranscriberHF
-    monkeypatch.setattr(ws, "AutoProcessor", types.SimpleNamespace(from_pretrained=lambda *a, **k: DummyProcessor()))
-    monkeypatch.setattr(ws, "AutoModelForSpeechSeq2Seq", types.SimpleNamespace(from_pretrained=lambda *a, **k: DummyModel()))
+    monkeypatch.setattr(
+        ws, "AutoProcessor", types.SimpleNamespace(from_pretrained=lambda *a, **k: DummyProcessor())
+    )
+    monkeypatch.setattr(
+        ws,
+        "AutoModelForSpeechSeq2Seq",
+        types.SimpleNamespace(from_pretrained=lambda *a, **k: DummyModel()),
+    )
     monkeypatch.setattr(ws, "pipeline", dummy_pipeline)
     yield
 

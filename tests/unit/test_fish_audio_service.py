@@ -2,9 +2,9 @@ import io
 import os
 import time
 import wave
+from unittest.mock import MagicMock, patch
 
 import requests
-from unittest.mock import MagicMock, patch
 
 from inference.fish_audio_service import FishAudioService
 
@@ -17,6 +17,7 @@ def _wav_bytes(sample_rate: int = 24000, frame_count: int = 16) -> bytes:
         wf.setframerate(sample_rate)
         wf.writeframes(b"\x00\x00" * frame_count)
     return buf.getvalue()
+
 
 def test_fish_audio_service_uses_session():
     svc = FishAudioService()

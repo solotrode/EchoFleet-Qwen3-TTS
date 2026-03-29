@@ -172,7 +172,9 @@ def wait_done(settings: Settings, status_url: str, job_name: str) -> dict[str, A
         if status in ("done", "failed"):
             return st
         if time.time() - start > settings.max_job_seconds:
-            raise TimeoutError(f"Timed out waiting for {job_name} after {settings.max_job_seconds}s")
+            raise TimeoutError(
+                f"Timed out waiting for {job_name} after {settings.max_job_seconds}s"
+            )
         time.sleep(settings.job_poll_interval_s)
 
 
@@ -255,9 +257,7 @@ def main() -> int:
                 break
 
             if time.time() - start2 > settings.max_job_seconds:
-                raise TimeoutError(
-                    f"Timed out monitoring job2 after {settings.max_job_seconds}s"
-                )
+                raise TimeoutError(f"Timed out monitoring job2 after {settings.max_job_seconds}s")
 
             time.sleep(settings.sample_interval_s)
 

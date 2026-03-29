@@ -3,21 +3,23 @@
 This module provides utilities for audio I/O, format conversion,
 and preprocessing operations.
 """
+
+import base64
 import io
 import os
 import re
-import base64
-from typing import Union, Tuple, Optional
-import requests
-import numpy as np
-import torch
-import soundfile as sf
+from typing import Iterable, Optional, Tuple, Union
 
-from utils.logging import get_logger
+import numpy as np
+import requests
+import soundfile as sf
+import torch
+
 from utils.errors import AudioProcessingError
-from typing import Iterable
+from utils.logging import get_logger
 
 logger = get_logger(__name__)
+
 
 def concat_wavs(wav_list, sample_rate: Optional[int] = None):
     """Concatenate a list of waveforms (torch.Tensor or numpy.ndarray).
@@ -74,7 +76,7 @@ def concat_wavs(wav_list, sample_rate: Optional[int] = None):
 
         # Ensure 1-D
         try:
-            if getattr(w, 'ndim', 1) > 1:
+            if getattr(w, "ndim", 1) > 1:
                 w = w.reshape(-1)
         except Exception:
             w = np.asarray(w).reshape(-1)
@@ -106,6 +108,7 @@ def concat_wavs(wav_list, sample_rate: Optional[int] = None):
 
     return out, inferred_sr
 
+
 def _mask_str(s: str, max_len: int = 120) -> str:
     """Return a truncated, safe representation of a potentially-large string.
 
@@ -126,7 +129,7 @@ def _mask_str(s: str, max_len: int = 120) -> str:
 
 def load_audio(
     source: Union[str, bytes, np.ndarray, torch.Tensor, Tuple[np.ndarray, int]],
-    target_sr: Optional[int] = None
+    target_sr: Optional[int] = None,
 ) -> Tuple[torch.Tensor, int]:
     """Load audio from various sources and return (tensor, sample_rate).
 
@@ -235,7 +238,9 @@ def load_audio(
             try:
                 exists = os.path.exists(src)
             except OSError as e:
-                logger.warning("Path check failed for audio source: %s; error=%s", _mask_str(src), e)
+                logger.warning(
+                    "Path check failed for audio source: %s; error=%s", _mask_str(src), e
+                )
                 raise AudioProcessingError("Invalid audio source path") from e
 
             if not exists:
@@ -259,7 +264,12 @@ def load_audio(
                     sr = target_sr
                 # Pad to frame boundaries to prevent encoder size mismatches
                 audio_tensor = pad_audio_to_frame_boundary(audio_tensor)
-                logger.debug("Loaded audio from path: %s, shape=%s, sr=%s", _mask_str(src), audio_tensor.shape, sr)
+                logger.debug(
+                    "Loaded audio from path: %s, shape=%s, sr=%s",
+                    _mask_str(src),
+                    audio_tensor.shape,
+                    sr,
+                )
                 return audio_tensor, int(sr)
             except Exception as e:
                 logger.exception("Failed processing audio from %s", _mask_str(src))
@@ -291,20 +301,18 @@ def load_audio(
 
 
 def save_audio(
-    audio: Union[torch.Tensor, np.ndarray],
-    file_path: str,
-    sample_rate: int = 24000
+    audio: Union[torch.Tensor, np.ndarray], file_path: str, sample_rate: int = 24000
 ) -> None:
     """Save audio tensor to file.
-    
+
     Args:
         audio: Audio tensor or numpy array.
         file_path: Destination file path.
         sample_rate: Audio sample rate.
-    
+
     Raises:
         AudioProcessingError: If saving fails.
-    
+
     Example:
         >>> audio = torch.randn(24000)  # 1 second at 24kHz
         >>> save_audio(audio, "output.wav", sample_rate=24000)
@@ -312,7 +320,7 @@ def save_audio(
     try:
         # Ensure output directory exists
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
-        
+
         # Convert to numpy if needed (accept lists, tuples, torch tensors)
         original_audio = audio
         if isinstance(audio, torch.Tensor):
@@ -329,7 +337,7 @@ def save_audio(
                 audio = np.asarray(original_audio)
 
         # Ensure proper dtype
-        if not hasattr(audio, 'dtype') or audio.dtype != np.float32:
+        if not hasattr(audio, "dtype") or audio.dtype != np.float32:
             try:
                 audio = audio.astype(np.float32)
             except Exception:
@@ -346,24 +354,20 @@ def save_audio(
 
         sf.write(file_path, audio, sample_rate)
         logger.debug("Saved audio to %s", _mask_str(file_path))
-    
+
     except Exception as e:
         logger.exception("Failed to save audio to %s", _mask_str(file_path))
         raise AudioProcessingError("Cannot save audio") from e
 
 
-def resample_audio(
-    audio: torch.Tensor,
-    orig_sr: int,
-    target_sr: int
-) -> torch.Tensor:
+def resample_audio(audio: torch.Tensor, orig_sr: int, target_sr: int) -> torch.Tensor:
     """Resample audio tensor to target sample rate.
-    
+
     Args:
         audio: Audio tensor to resample.
         orig_sr: Original sample rate.
         target_sr: Target sample rate.
-    
+
     Returns:
         Resampled audio tensor.
     """
@@ -371,20 +375,18 @@ def resample_audio(
 
 
 def pad_audio_to_frame_boundary(
-    audio: torch.Tensor,
-    frame_size: int = 320,
-    hop_length: int = 160
+    audio: torch.Tensor, frame_size: int = 320, hop_length: int = 160
 ) -> torch.Tensor:
     """Pad audio to align with encoder frame boundaries.
-    
+
     This prevents tensor size mismatches in the speech tokenizer encoder
     by ensuring the audio length is compatible with the model's stride.
-    
+
     Args:
         audio: Audio tensor to pad (shape: [samples] or [batch, samples]).
         frame_size: Size of each frame window (default 320 for 24kHz -> 12Hz).
         hop_length: Hop length between frames (default 160 for 50% overlap).
-    
+
     Returns:
         Padded audio tensor aligned to frame boundaries.
     """
@@ -393,39 +395,37 @@ def pad_audio_to_frame_boundary(
         squeeze_output = True
     else:
         squeeze_output = False
-    
+
     batch_size, length = audio.shape
-    
+
     # Calculate required padding to align to hop_length boundaries
     # The encoder processes audio in overlapping frames with stride=hop_length
     remainder = (length - frame_size) % hop_length
     if remainder != 0:
         pad_length = hop_length - remainder
         # Pad with zeros at the end
-        audio = torch.nn.functional.pad(audio, (0, pad_length), mode='constant', value=0.0)
-        logger.debug(f"Padded audio by {pad_length} samples for frame alignment (original: {length}, new: {audio.shape[-1]})")
-    
+        audio = torch.nn.functional.pad(audio, (0, pad_length), mode="constant", value=0.0)
+        logger.debug(
+            f"Padded audio by {pad_length} samples for frame alignment (original: {length}, new: {audio.shape[-1]})"
+        )
+
     if squeeze_output:
         audio = audio.squeeze(0)
-    
+
     return audio
 
 
-def resample_audio(
-    audio: torch.Tensor,
-    orig_sr: int,
-    target_sr: int
-) -> torch.Tensor:
+def resample_audio(audio: torch.Tensor, orig_sr: int, target_sr: int) -> torch.Tensor:
     """Resample audio tensor to target sample rate.
-    
+
     Args:
         audio: Audio tensor to resample.
         orig_sr: Original sample rate.
         target_sr: Target sample rate.
-    
+
     Returns:
         Resampled audio tensor.
-    
+
     Example:
         >>> audio_16k = torch.randn(16000)
         >>> audio_24k = resample_audio(audio_16k, 16000, 24000)
@@ -457,16 +457,16 @@ def resample_audio(
 
 def get_audio_duration(file_path: str) -> float:
     """Get audio file duration in seconds.
-    
+
     Args:
         file_path: Path to audio file.
-    
+
     Returns:
         Duration in seconds.
-    
+
     Raises:
         AudioProcessingError: If duration cannot be determined.
-    
+
     Example:
         >>> duration = get_audio_duration("audio.wav")
         >>> print(f"{duration:.2f} seconds")
@@ -476,7 +476,7 @@ def get_audio_duration(file_path: str) -> float:
         duration = info.duration
         logger.debug("Audio duration: %s = %.2fs", _mask_str(file_path), duration)
         return duration
-    
+
     except Exception as e:
         logger.error("Failed to get duration for %s: %s", _mask_str(file_path), e)
         raise AudioProcessingError("Cannot determine audio duration") from e
@@ -484,63 +484,62 @@ def get_audio_duration(file_path: str) -> float:
 
 def normalize_text(text: str) -> str:
     """Normalize text for comparison (used in accuracy scoring).
-    
+
     Args:
         text: Input text to normalize.
-    
+
     Returns:
         Normalized text (lowercase, no punctuation, single spaces).
-    
+
     Example:
         >>> normalize_text("Hello,  World!")
         'hello world'
     """
     # Convert to lowercase
     text = text.lower()
-    
+
     # Remove punctuation except apostrophes
     text = re.sub(r"[^\w\s']", " ", text)
-    
+
     # Collapse multiple spaces
     text = re.sub(r"\s+", " ", text)
-    
+
     # Strip leading/trailing whitespace
     text = text.strip()
-    
+
     return text
 
 
 def convert_audio_format(
-    input_path: str,
-    output_path: str,
-    output_format: str = "wav",
-    sample_rate: Optional[int] = None
+    input_path: str, output_path: str, output_format: str = "wav", sample_rate: Optional[int] = None
 ) -> None:
     """Convert audio file to different format.
-    
+
     Args:
         input_path: Input audio file path.
         output_path: Output audio file path.
         output_format: Output format ('wav', 'mp3', 'flac', etc.).
         sample_rate: Target sample rate. If None, keeps original.
-    
+
     Raises:
         AudioProcessingError: If conversion fails.
-    
+
     Example:
         >>> convert_audio_format("input.wav", "output.mp3", "mp3", 24000)
     """
     try:
         audio, sr = load_audio(input_path, target_sr=sample_rate)
-        
+
         # Ensure output directory exists
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
         # Save in target format
         sf.write(output_path, audio.numpy(), sr or 24000, format=output_format)
 
-        logger.info("Converted %s -> %s (%s)", _mask_str(input_path), _mask_str(output_path), output_format)
-    
+        logger.info(
+            "Converted %s -> %s (%s)", _mask_str(input_path), _mask_str(output_path), output_format
+        )
+
     except Exception as e:
         logger.exception("Audio format conversion failed")
         raise AudioProcessingError("Conversion failed") from e

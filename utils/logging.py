@@ -6,13 +6,13 @@ for better observability and debugging in production environments.
 
 from __future__ import annotations
 
-import logging
 import json
+import logging
 import os
 import sys
-from typing import Optional, Dict, Any
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
+from typing import Any, Dict, Optional
 
 
 def get_logger(name: Optional[str] = None) -> logging.Logger:
@@ -23,7 +23,7 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
 
     Returns:
         Configured logger instance.
-    
+
     Example:
         >>> logger = get_logger(__name__)
         >>> logger.info("Processing started", extra={"job_id": "123"})
@@ -32,16 +32,20 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
 
     stdout_handler: Optional[logging.Handler] = None
     for existing in logger.handlers:
-        if isinstance(existing, logging.StreamHandler) and getattr(existing, "stream", None) is sys.stdout:
+        if (
+            isinstance(existing, logging.StreamHandler)
+            and getattr(existing, "stream", None) is sys.stdout
+        ):
             stdout_handler = existing
             break
 
     if stdout_handler is None:
         stdout_handler = logging.StreamHandler(sys.stdout)
         logger.addHandler(stdout_handler)
-    
+
     # Use structured logging from environment if configured
     from config.settings import get_settings
+
     try:
         settings = get_settings()
         use_structured = settings.structured_logging
@@ -55,7 +59,7 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
         log_to_file = False
         log_file_path = ""
         log_retention_days = 10
-    
+
     if use_structured:
         formatter = StructuredFormatter()
     else:
@@ -99,17 +103,17 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
 
 class StructuredFormatter(logging.Formatter):
     """JSON formatter for structured logging.
-    
+
     Outputs logs as JSON objects with consistent schema for parsing
     by log aggregation tools.
     """
-    
+
     def format(self, record: logging.LogRecord) -> str:
         """Format log record as JSON.
-        
+
         Args:
             record: Log record to format.
-        
+
         Returns:
             JSON string representation of the log record.
         """
@@ -119,61 +123,71 @@ class StructuredFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
-        
+
         # Add exception info if present
         if record.exc_info:
             log_data["exception"] = self.formatException(record.exc_info)
-        
+
         # Add extra fields from logger.info(..., extra={...})
         if hasattr(record, "__dict__"):
             for key, value in record.__dict__.items():
                 if key not in [
-                    "name", "msg", "args", "created", "filename", "funcName",
-                    "levelname", "levelno", "lineno", "module", "msecs",
-                    "message", "pathname", "process", "processName",
-                    "relativeCreated", "thread", "threadName", "exc_info",
-                    "exc_text", "stack_info"
+                    "name",
+                    "msg",
+                    "args",
+                    "created",
+                    "filename",
+                    "funcName",
+                    "levelname",
+                    "levelno",
+                    "lineno",
+                    "module",
+                    "msecs",
+                    "message",
+                    "pathname",
+                    "process",
+                    "processName",
+                    "relativeCreated",
+                    "thread",
+                    "threadName",
+                    "exc_info",
+                    "exc_text",
+                    "stack_info",
                 ]:
                     log_data[key] = value
-        
+
         return json.dumps(log_data, default=str)
 
 
 def status_log(component: str, event: str, **kwargs: Any) -> None:
     """Emit a structured status log for operational monitoring.
-    
+
     This is a convenience function for emitting standardized status events
     that can be easily parsed by monitoring systems.
-    
+
     Args:
         component: Component name (e.g., 'gpu_pool', 'api', 'worker').
         event: Event name (e.g., 'job_started', 'model_loaded').
         **kwargs: Additional context fields.
-    
+
     Example:
         >>> status_log("gpu_pool", "job_assigned", job_id="123", gpu_id=0)
     """
     logger = get_logger("status")
-    logger.info(
-        f"{component}.{event}",
-        extra={"component": component, "event": event, **kwargs}
-    )
+    logger.info(f"{component}.{event}", extra={"component": component, "event": event, **kwargs})
 
 
 def structured_error_log(
-    job_id: str,
-    correlation_id: str,
-    error: Exception,
-    extra: Optional[Dict[str, Any]] = None
+    job_id: str, correlation_id: str, error: Exception, extra: Optional[Dict[str, Any]] = None
 ) -> None:
     """Log an error with structured context for debugging.
-    
+
     Args:
         job_id: Job identifier.
         correlation_id: Request correlation ID.
         error: Exception that occurred.
         extra: Additional context fields.
-    
+
     Example:
         >>> try:
         ...     risky_operation()
@@ -189,7 +203,7 @@ def structured_error_log(
     }
     if extra:
         context.update(extra)
-    
+
     logger.error(f"Error in job {job_id}", extra=context, exc_info=error)
 
 

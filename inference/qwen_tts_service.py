@@ -14,24 +14,24 @@ Note:
 
 from __future__ import annotations
 
-import threading
+import gc
 import logging
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import soundfile as sf
 import torch
-import time
+from qwen_tts import Qwen3TTSModel
 
 from config.settings import Settings
-from qwen_tts import Qwen3TTSModel
-from utils.logging import get_logger
-from utils.audio_utils import load_audio, concat_wavs
-from utils.text_chunker import chunk_text
-from utils.gpu_pool import GpuLeasePool
 from inference.generation_limits import estimate_max_new_tokens
-import gc
+from utils.audio_utils import concat_wavs, load_audio
+from utils.gpu_pool import GpuLeasePool
+from utils.logging import get_logger
+from utils.text_chunker import chunk_text
 
 logger = get_logger(__name__)
 
@@ -75,8 +75,9 @@ def _ensure_speech_tokenizer_on_device(model: object, device: str, dtype: torch.
         dtype: Target dtype for the tokenizer model weights.
     """
     from utils.logging import get_logger
+
     logger = get_logger(__name__)
-    
+
     if device == "cpu":
         return
 
@@ -105,8 +106,8 @@ def _ensure_speech_tokenizer_on_device(model: object, device: str, dtype: torch.
             extra={
                 "current_device": current_device,
                 "target_device": device,
-                "has_inner_model": inner is not None
-            }
+                "has_inner_model": inner is not None,
+            },
         )
     except Exception as e:
         logger.warning(f"Failed to check tokenizer device: {e}")
@@ -121,7 +122,7 @@ def _ensure_speech_tokenizer_on_device(model: object, device: str, dtype: torch.
                 if tok_dev is None or str(tok_dev) == str(torch.device(device)):
                     logger.info(
                         "Speech tokenizer already on target device - skipping move",
-                        extra={"device": device}
+                        extra={"device": device},
                     )
                     return
     except Exception:
@@ -129,8 +130,7 @@ def _ensure_speech_tokenizer_on_device(model: object, device: str, dtype: torch.
         pass
 
     logger.info(
-        "Moving speech tokenizer to device",
-        extra={"target_device": device, "dtype": str(dtype)}
+        "Moving speech tokenizer to device", extra={"target_device": device, "dtype": str(dtype)}
     )
 
     # The tokenizer wrapper holds an internal torch module at `.model`.
@@ -166,7 +166,7 @@ def _ensure_speech_tokenizer_on_device(model: object, device: str, dtype: torch.
             logger.info("Set tokenizer.device attribute", extra={"device": device})
         except Exception as e:
             logger.warning(f"Failed to set tokenizer.device: {e}")
-    
+
     # Log final device state
     try:
         inner = getattr(speech_tokenizer, "model", None)
@@ -175,10 +175,11 @@ def _ensure_speech_tokenizer_on_device(model: object, device: str, dtype: torch.
             final_device = str(next(inner.parameters()).device)
         logger.info(
             "Speech tokenizer device after move",
-            extra={"final_device": final_device, "target_device": device}
+            extra={"final_device": final_device, "target_device": device},
         )
     except Exception as e:
         logger.warning(f"Failed to verify final tokenizer device: {e}")
+
 
 # Qwen3TTSModel.from_pretrained() performs global AutoConfig/AutoModel/AutoProcessor
 # registrations. Those registrations are not thread-safe. When multiple worker
@@ -219,7 +220,6 @@ class QwenTTSServer:
 
         # The GpuLeasePool is no longer needed here, as each worker has a dedicated device.
         self._gpu_pool: Optional[GpuLeasePool] = None
-
 
     def _torch_dtype(self) -> torch.dtype:
         # Use float32 by default for stability with tokenizer/conv ops
@@ -302,9 +302,10 @@ class QwenTTSServer:
     def _lease_device(self):
         """Return the assigned device for this worker instance."""
         from contextlib import nullcontext
+
         if self._assigned_device:
             return nullcontext(self._assigned_device)
-        
+
         # Fallback to CPU if no device is assigned
         logger.warning("No assigned device for this worker, falling back to CPU.")
         return nullcontext("cpu")
@@ -403,12 +404,12 @@ class QwenTTSServer:
                 # dtype in `from_pretrained`. Pre-loading config and setting `config.dtype`
                 # avoids that warning and keeps the dtype explicit.
                 try:
-                    from transformers import AutoConfig, AutoProcessor
                     from qwen_tts.core.models import (
                         Qwen3TTSConfig,
                         Qwen3TTSForConditionalGeneration,
                         Qwen3TTSProcessor,
                     )
+                    from transformers import AutoConfig, AutoProcessor
 
                     AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
                     AutoProcessor.register(Qwen3TTSConfig, Qwen3TTSProcessor)
@@ -438,7 +439,9 @@ class QwenTTSServer:
                         "model_type": model_type,
                         "device": device,
                         "config_injected": cfg is not None,
-                        "config_dtype": str(getattr(cfg, "dtype", None)) if cfg is not None else None,
+                        "config_dtype": (
+                            str(getattr(cfg, "dtype", None)) if cfg is not None else None
+                        ),
                         "attn_implementation": attn_impl,
                     },
                 )
@@ -510,7 +513,11 @@ class QwenTTSServer:
                                 if hf_map:
                                     logger.warning(
                                         "Clearing unexpected hf_device_map for single-device execution",
-                                        extra={"model_type": model_type, "device": device, "hf_device_map": str(hf_map)[:500]},
+                                        extra={
+                                            "model_type": model_type,
+                                            "device": device,
+                                            "hf_device_map": str(hf_map)[:500],
+                                        },
                                     )
                                 try:
                                     delattr(core, "hf_device_map")
@@ -596,18 +603,18 @@ class QwenTTSServer:
 
         # Log model device (determine from model parameters to be accurate)
         try:
-            if hasattr(model, 'model') and hasattr(model.model, 'parameters'):
+            if hasattr(model, "model") and hasattr(model.model, "parameters"):
                 model_param_device = next(model.model.parameters()).device
-            elif hasattr(model, 'parameters'):
+            elif hasattr(model, "parameters"):
                 model_param_device = next(model.parameters()).device
             else:
-                model_param_device = torch.device('cpu')
+                model_param_device = torch.device("cpu")
             logger.info(
                 "Set model device",
-                extra={"model_type": model_type, "model_param_device": str(model_param_device)}
+                extra={"model_type": model_type, "model_param_device": str(model_param_device)},
             )
         except Exception:
-            model_param_device = torch.device('cpu')
+            model_param_device = torch.device("cpu")
 
         # Log tokenizer device separately (it is not a torch module).
         try:
@@ -627,8 +634,12 @@ class QwenTTSServer:
                     "Set speech tokenizer device",
                     extra={
                         "model_type": model_type,
-                        "speech_tokenizer_device": str(tok_device) if tok_device is not None else None,
-                        "speech_tokenizer_param_device": str(inner_device) if inner_device is not None else None,
+                        "speech_tokenizer_device": (
+                            str(tok_device) if tok_device is not None else None
+                        ),
+                        "speech_tokenizer_param_device": (
+                            str(inner_device) if inner_device is not None else None
+                        ),
                     },
                 )
         except Exception:
@@ -636,13 +647,13 @@ class QwenTTSServer:
 
         # DO NOT call model.to(device) - it conflicts with device_map and causes hanging!
         # The model is already placed on the device by device_map parameter.
-        
+
         logger.info(
             "Model loaded successfully",
             extra={
                 "model_type": model_type,
                 "device": device,
-            }
+            },
         )
 
         with self._lock:
@@ -662,12 +673,12 @@ class QwenTTSServer:
         """
         unloaded = []
         devices_affected = set()
-        
+
         logger.info(
             "Unload requested",
-            extra={"model_type": model_type, "cached_models": list(self._models.keys())}
+            extra={"model_type": model_type, "cached_models": list(self._models.keys())},
         )
-        
+
         with self._lock:
             keys = list(self._models.keys())
             for key in keys:
@@ -676,17 +687,17 @@ class QwenTTSServer:
                     try:
                         model = self._models.pop(key)
                         logger.info(f"Unloading model from cache: {key}")
-                        
+
                         # Track which devices were affected
                         if dev != "cpu" and dev.startswith("cuda:"):
                             devices_affected.add(dev)
-                        
+
                         # Delete the model reference immediately
                         try:
                             del model
                         except Exception as e:
                             logger.warning(f"Failed to delete model {key}: {e}")
-                        
+
                         unloaded.append((mt, dev))
                     except KeyError:
                         continue
@@ -700,14 +711,14 @@ class QwenTTSServer:
                     torch.cuda.synchronize(device_id)
                 except Exception as e:
                     logger.warning(f"CUDA synchronize failed for {dev_str}: {e}")
-            
+
             # Run garbage collection multiple times
             try:
                 for i in range(5):
                     gc.collect()
             except Exception as e:
                 logger.warning(f"GC failed: {e}")
-            
+
             # Empty cache for each affected device multiple times
             for dev_str in devices_affected:
                 try:
@@ -721,7 +732,7 @@ class QwenTTSServer:
                     logger.info(f"CUDA cache emptied for {dev_str}")
                 except Exception as e:
                     logger.warning(f"CUDA empty_cache failed for {dev_str}: {e}")
-            
+
             # One final global empty cache
             try:
                 torch.cuda.empty_cache()
@@ -735,9 +746,9 @@ class QwenTTSServer:
 
         logger.info(
             "Unload complete",
-            extra={"unloaded": unloaded, "remaining_models": list(self._models.keys())}
+            extra={"unloaded": unloaded, "remaining_models": list(self._models.keys())},
         )
-        
+
         return unloaded
 
     def unload_idle_models(self, idle_seconds: Optional[int] = None) -> list[Tuple[str, str]]:
@@ -882,7 +893,9 @@ class QwenTTSServer:
                     "Speech tokenizer device check",
                     extra={
                         "speech_tokenizer_param_device": tok_inner_dev,
-                        "speech_tokenizer_device_attr": str(tok_device_attr) if tok_device_attr is not None else None,
+                        "speech_tokenizer_device_attr": (
+                            str(tok_device_attr) if tok_device_attr is not None else None
+                        ),
                     },
                 )
             except Exception:
@@ -909,10 +922,12 @@ class QwenTTSServer:
                     _ensure_speech_tokenizer_on_device(model, device=device, dtype=dtype)
                     logger.info(
                         "Speech tokenizer device enforced before prompt creation",
-                        extra={"device": device, "gpu_id": active_gpu_id}
+                        extra={"device": device, "gpu_id": active_gpu_id},
                     )
                 except Exception:
-                    logger.exception("Failed to enforce speech tokenizer device before prompt creation")
+                    logger.exception(
+                        "Failed to enforce speech tokenizer device before prompt creation"
+                    )
 
             with torch.no_grad(), device_context:
                 lang_for_model = self._ensure_language(language)
@@ -961,18 +976,18 @@ class QwenTTSServer:
                             max_new_tokens_total = int(model_limit)
                             logger.info(
                                 "Using model max_new_tokens from generation_config",
-                                extra={"max_new_tokens": max_new_tokens_total}
+                                extra={"max_new_tokens": max_new_tokens_total},
                             )
                 except Exception as e:
                     logger.warning(f"Could not read model generation_config: {e}")
-                
+
                 # If no model limit found, use a very high default (effectively unlimited)
                 # Increased fallback budget to reduce unnecessary retries for long inputs.
                 if max_new_tokens_total is None:
                     max_new_tokens_total = 16384
                     logger.info(
                         "No model limit found, using high default",
-                        extra={"max_new_tokens": max_new_tokens_total}
+                        extra={"max_new_tokens": max_new_tokens_total},
                     )
 
                 # Log the actual input text to verify it's not being truncated before chunking
@@ -981,13 +996,13 @@ class QwenTTSServer:
                     extra={
                         "text_length": len(text),
                         "text_preview_start": text[:200],
-                        "text_preview_end": text[-200:] if len(text) > 200 else text
-                    }
+                        "text_preview_end": text[-200:] if len(text) > 200 else text,
+                    },
                 )
 
                 # Chunk text by sentence boundaries using configured limit
                 chunks = chunk_text(text, max_chars=self._settings.tts_chunk_max_chars)
-                
+
                 logger.info(
                     "Text chunking complete",
                     extra={
@@ -996,8 +1011,8 @@ class QwenTTSServer:
                         "num_chunks": len(chunks),
                         "chunk_lengths": [len(c) for c in chunks],
                         "first_chunk_preview": chunks[0][:100] if chunks else None,
-                        "last_chunk_preview": chunks[-1][:100] if chunks else None
-                    }
+                        "last_chunk_preview": chunks[-1][:100] if chunks else None,
+                    },
                 )
 
                 if not chunks:
@@ -1031,11 +1046,12 @@ class QwenTTSServer:
                     extra={
                         "total_chunks": len(chunks),
                         "max_new_tokens_per_chunk": max_new_tokens_total,
-                        "chunk_texts": [ch[:50] + "..." if len(ch) > 50 else ch for ch in chunks]
-                    }
+                        "chunk_texts": [ch[:50] + "..." if len(ch) > 50 else ch for ch in chunks],
+                    },
                 )
-                
+
                 import numpy as _np
+
                 chunk_outputs = []
                 out_sr = None
 
@@ -1045,7 +1061,7 @@ class QwenTTSServer:
                 # but each thread uses a different GPU. Reusing a cached prompt
                 # from GPU 0 on threads using GPU 1/2/3 causes cross-GPU transfers
                 # and massive slowdowns (6 minutes per chunk instead of 90 seconds).
-                # 
+                #
                 # Let each chunk build its own prompt on its assigned GPU.
 
                 # Telemetry: record per-chunk start/end timestamps (epoch seconds)
@@ -1053,7 +1069,7 @@ class QwenTTSServer:
 
                 for chunk_idx, ch in enumerate(chunks):
                     chunk_start = time.time()
-                    
+
                     # Verify model/tokenizer device state before chunk generation
                     device_check = {}
                     try:
@@ -1070,7 +1086,7 @@ class QwenTTSServer:
                             device_check["cuda_current"] = int(torch.cuda.current_device())
                     except Exception:
                         pass
-                    
+
                     logger.info(
                         "Starting chunk generation",
                         extra={
@@ -1079,8 +1095,8 @@ class QwenTTSServer:
                             "chunk_text_preview": ch[:60],
                             "chunk_start_time": chunk_start,
                             "lease_device": device,
-                            **device_check
-                        }
+                            **device_check,
+                        },
                     )
 
                     gen_kwargs = dict(
@@ -1093,7 +1109,7 @@ class QwenTTSServer:
                         repetition_penalty=1.05,  # Official benchmark default
                         max_new_tokens=max_new_tokens_total,
                     )
-                    
+
                     # Estimate tokens needed for this chunk based on text length.
                     # Use 12 tokens/sec audio, ~150 words/min speech = 2.5 words/sec,
                     # and ~5 chars/word average. Add 2x safety margin.
@@ -1101,9 +1117,9 @@ class QwenTTSServer:
                     estimated_tokens = int(estimated_audio_sec * 12 * 2.0)  # 2x safety margin
                     chunk_max_tokens = min(estimated_tokens, max_new_tokens_total)
                     chunk_max_tokens = max(chunk_max_tokens, 96)  # Minimum floor
-                    
+
                     gen_kwargs["max_new_tokens"] = chunk_max_tokens
-                    
+
                     logger.info(
                         "Chunk generation params",
                         extra={
@@ -1111,9 +1127,9 @@ class QwenTTSServer:
                             "text_len": len(ch),
                             "estimated_audio_sec": round(estimated_audio_sec, 1),
                             "max_new_tokens": chunk_max_tokens,
-                        }
+                        },
                     )
-                    
+
                     # Always pass ref_audio/ref_text so each chunk builds its own prompt
                     # on the correct GPU (no cross-GPU tensor sharing)
                     gen_kwargs["ref_audio"] = ref_for_model
@@ -1134,10 +1150,16 @@ class QwenTTSServer:
                                 extra={
                                     "chunk_index": chunk_idx,
                                     "expected_device": device,
-                                    "tokenizer_attr_device": str(tok_dev_attr) if tok_dev_attr else None,
+                                    "tokenizer_attr_device": (
+                                        str(tok_dev_attr) if tok_dev_attr else None
+                                    ),
                                     "tokenizer_param_device": tok_inner_dev,
-                                    "model_param_device": str(next(model.model.parameters()).device) if hasattr(model.model, "parameters") else None
-                                }
+                                    "model_param_device": (
+                                        str(next(model.model.parameters()).device)
+                                        if hasattr(model.model, "parameters")
+                                        else None
+                                    ),
+                                },
                             )
                     except Exception as e:
                         logger.warning(f"Failed to check tokenizer device before generate: {e}")
@@ -1145,15 +1167,22 @@ class QwenTTSServer:
                     wavs, sr = model.generate_voice_clone(**gen_kwargs)
                     chunk_end = time.time()
                     chunk_duration = chunk_end - chunk_start
-                    chunk_times.append({"chunk_index": chunk_idx, "start": chunk_start, "end": chunk_end, "duration": round(chunk_duration, 3)})
-                    
+                    chunk_times.append(
+                        {
+                            "chunk_index": chunk_idx,
+                            "start": chunk_start,
+                            "end": chunk_end,
+                            "duration": round(chunk_duration, 3),
+                        }
+                    )
+
                     logger.info(
                         "Chunk generation completed",
                         extra={
                             "chunk_index": chunk_idx,
                             "duration_seconds": round(chunk_duration, 2),
-                            "device": device
-                        }
+                            "device": device,
+                        },
                     )
 
                     # Log what the model actually returned
@@ -1166,8 +1195,8 @@ class QwenTTSServer:
                                 "chunk_index": chunk_idx,
                                 "wavs_type": wavs_type,
                                 "wavs_len": wavs_len,
-                                "sr": sr
-                            }
+                                "sr": sr,
+                            },
                         )
                     except Exception:
                         logger.exception("Failed to log model return type")
@@ -1177,7 +1206,7 @@ class QwenTTSServer:
 
                     # Extract the first element (primary audio segment for this chunk)
                     chunk_wav = wavs[0]
-                    
+
                     # Log the raw type before conversion
                     try:
                         raw_type = type(chunk_wav).__name__
@@ -1191,7 +1220,11 @@ class QwenTTSServer:
                             raw_details = str(type(chunk_wav))
                         logger.info(
                             "Raw chunk wav type",
-                            extra={"chunk_index": chunk_idx, "type": raw_type, "details": raw_details}
+                            extra={
+                                "chunk_index": chunk_idx,
+                                "type": raw_type,
+                                "details": raw_details,
+                            },
                         )
                     except Exception:
                         logger.exception("Failed to log raw chunk type")
@@ -1207,7 +1240,9 @@ class QwenTTSServer:
                             parts = []
                             for item in chunk_wav:
                                 if isinstance(item, torch.Tensor):
-                                    parts.append(item.cpu().numpy() if item.is_cuda else item.numpy())
+                                    parts.append(
+                                        item.cpu().numpy() if item.is_cuda else item.numpy()
+                                    )
                                 elif isinstance(item, _np.ndarray):
                                     parts.append(item)
                                 else:
@@ -1219,15 +1254,15 @@ class QwenTTSServer:
                         # Ensure 1-D
                         if chunk_wav.ndim > 1:
                             chunk_wav = chunk_wav.reshape(-1)
-                        
+
                         # Ensure float32
                         if chunk_wav.dtype != _np.float32:
                             chunk_wav = chunk_wav.astype(_np.float32)
-                        
+
                         # Ensure contiguous
                         if not chunk_wav.flags["C_CONTIGUOUS"]:
                             chunk_wav = _np.ascontiguousarray(chunk_wav)
-                            
+
                     except Exception:
                         logger.exception(f"Failed to normalize chunk {chunk_idx} audio")
                         raise RuntimeError(f"Chunk {chunk_idx} normalization failed")
@@ -1237,10 +1272,10 @@ class QwenTTSServer:
                     if chunk_samples == 0:
                         logger.error(
                             "Chunk produced zero samples",
-                            extra={"chunk_index": chunk_idx, "chunk_text": ch[:100]}
+                            extra={"chunk_index": chunk_idx, "chunk_text": ch[:100]},
                         )
                         raise RuntimeError(f"Chunk {chunk_idx} produced no audio")
-                    
+
                     logger.info(
                         "Chunk normalized and validated",
                         extra={
@@ -1248,8 +1283,8 @@ class QwenTTSServer:
                             "samples": chunk_samples,
                             "duration_sec": round(chunk_samples / sr, 3),
                             "dtype": str(chunk_wav.dtype),
-                            "shape": chunk_wav.shape
-                        }
+                            "shape": chunk_wav.shape,
+                        },
                     )
 
                     chunk_outputs.append(chunk_wav)
@@ -1262,10 +1297,10 @@ class QwenTTSServer:
                         "total_chunks_collected": len(chunk_outputs),
                         "expected_chunks": len(chunks),
                         "chunk_samples": [c.size for c in chunk_outputs],
-                        "chunk_times": chunk_times
-                    }
+                        "chunk_times": chunk_times,
+                    },
                 )
-                
+
                 if len(chunk_outputs) != len(chunks):
                     raise RuntimeError(
                         f"Chunk count mismatch: collected {len(chunk_outputs)} but expected {len(chunks)}"
@@ -1277,37 +1312,37 @@ class QwenTTSServer:
                     # Add 100ms silence between chunks (2400 samples at 24kHz)
                     silence_samples = int(0.1 * out_sr)
                     silence = _np.zeros(silence_samples, dtype=_np.float32)
-                    
+
                     parts = []
                     for i, chunk_wav in enumerate(chunk_outputs):
                         parts.append(chunk_wav)
                         # Add silence between chunks (but not after the last one)
                         if i < len(chunk_outputs) - 1:
                             parts.append(silence)
-                    
+
                     full_wav = _np.concatenate(parts)
                     if not full_wav.flags["C_CONTIGUOUS"]:
                         full_wav = _np.ascontiguousarray(full_wav)
-                    
+
                     total_samples = full_wav.size
                     expected_samples = sum(c.size for c in chunk_outputs)
-                    
+
                     logger.info(
                         "Chunks concatenated successfully",
                         extra={
                             "total_samples": total_samples,
                             "expected_samples": expected_samples,
                             "duration_sec": round(total_samples / out_sr, 3),
-                            "sample_rate": out_sr
-                        }
+                            "sample_rate": out_sr,
+                        },
                     )
-                    
+
                     if total_samples != expected_samples:
                         logger.warning(
                             "Sample count mismatch after concatenation",
-                            extra={"got": total_samples, "expected": expected_samples}
+                            extra={"got": total_samples, "expected": expected_samples},
                         )
-                    
+
                 except Exception:
                     logger.exception("Failed to concatenate chunks")
                     raise RuntimeError("Chunk concatenation failed")

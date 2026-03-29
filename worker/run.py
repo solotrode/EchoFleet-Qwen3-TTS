@@ -8,9 +8,9 @@ RQ pubsub idle disconnect behavior.
 from __future__ import annotations
 
 import faulthandler
+import json
 import multiprocessing
 import signal
-import json
 import threading
 import time
 

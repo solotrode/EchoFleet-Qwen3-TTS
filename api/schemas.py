@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal, Optional, List
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, validator
 
@@ -153,7 +153,9 @@ class EnhancedAudioResponse(AudioResponse):
     all_candidates: Optional[List[CandidateScore]] = Field(
         default=None, description="All candidate scores (if return_all_candidates=True)"
     )
-    num_candidates_generated: Optional[int] = Field(default=None, description="Total candidates generated")
+    num_candidates_generated: Optional[int] = Field(
+        default=None, description="Total candidates generated"
+    )
 
 
 class JobSubmitResponse(BaseModel):

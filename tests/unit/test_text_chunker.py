@@ -8,9 +8,7 @@ def test_empty_text():
 
 
 def test_short_text_single_chunk():
-    text = (
-        "The rich pay less in taxes than you do. And it's completely legal."
-    )
+    text = "The rich pay less in taxes than you do. And it's completely legal."
     chunks = chunk_text(text, max_chars=1000)
     assert len(chunks) == 1
     assert text.replace("  ", " ") in chunks[0]
@@ -32,4 +30,4 @@ def test_sentence_longer_than_limit_keeps_whole_sentence():
     # max_chars smaller than sentence length, but chunker should keep the sentence whole
     chunks = chunk_text(long_sentence, max_chars=200)
     assert len(chunks) == 1
-    assert chunks[0].endswith('.')
+    assert chunks[0].endswith(".")

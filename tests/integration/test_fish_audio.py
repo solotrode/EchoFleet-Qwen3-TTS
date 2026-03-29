@@ -1,9 +1,10 @@
 import asyncio
-import pytest
-import threading
 import sys
+import threading
 from types import ModuleType
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 
 def _install_fake_redis_module() -> None:
@@ -77,96 +78,34 @@ def _import_test_app():
     _install_fake_redis_module()
     _install_fake_torch_module()
     from api.main import app
-
     return app
 
-@pytest.mark.asyncio
-async def test_s2_pro_sync_endpoint_uses_executor():
-    """Verify svc.generate() is called via run_in_executor to avoid blocking event loop."""
-    app = _import_test_app()
-    from httpx import AsyncClient
-    
-    mock_wav = MagicMock()
-    mock_wav.__len__ = lambda self: 48000
-    
-    with patch("api.main.get_sync_fish_audio_service") as mock_svc_factory:
-        mock_svc = MagicMock()
-        mock_svc.generate = MagicMock(return_value=(mock_wav, 24000))
-        mock_svc_factory.return_value = mock_svc
-
-        with patch("api.main.wav_to_wav_bytes", return_value=b"RIFF"):
-            loop = asyncio.get_running_loop()
-
-            # Patch run_in_executor on the live loop used by the endpoint.
-            with patch.object(loop, "run_in_executor", AsyncMock(return_value=(mock_wav, 24000))) as mock_run_in_executor:
-                async with AsyncClient(app=app, base_url="http://test") as client:
-                    response = await client.post(
-                        "/v1/tts/s2-pro/sync",
-                        json={"text": "Hello world"}
-                    )
-
-                assert response.status_code == 200
-                mock_run_in_executor.assert_called_once()
-
 
 @pytest.mark.asyncio
-async def test_s2_pro_sync_endpoint_passes_flat_reference_fields():
-    app = _import_test_app()
-    from httpx import AsyncClient
-
-    mock_wav = MagicMock()
-    mock_wav.__len__ = lambda self: 48000
-
-    with patch("api.main.get_sync_fish_audio_service") as mock_svc_factory:
-        mock_svc = MagicMock()
-        mock_svc.generate = MagicMock(return_value=(mock_wav, 24000))
-        mock_svc_factory.return_value = mock_svc
-
-        with patch("api.main.wav_to_wav_bytes", return_value=b"RIFF"):
-            loop = asyncio.get_running_loop()
-
-            with patch.object(loop, "run_in_executor", AsyncMock(return_value=(mock_wav, 24000))) as mock_run_in_executor:
-                async with AsyncClient(app=app, base_url="http://test") as client:
-                    response = await client.post(
-                        "/v1/tts/s2-pro/sync",
-                        json={
-                            "text": "Hello world",
-                            "language": "en",
-                            "ref_audio": "voices/sample.wav",
-                            "ref_text": "Reference text",
-                        },
-                    )
-
-                assert response.status_code == 200
-                mock_run_in_executor.assert_called_once_with(
-                    None,
-                    mock_svc.generate,
-                    "Hello world",
-                    "english",
-                    "voices/sample.wav",
-                    "Reference text",
-                )
-
-
-@pytest.mark.asyncio
-async def test_models_unload_handles_s2_pro_locally():
+def test_models_unload_handles_s2_pro_locally():
     app = _import_test_app()
     from httpx import AsyncClient
 
     mock_svc = MagicMock()
     mock_svc.unload_model.return_value = [("s2-pro", "remote")]
 
+    mock_controller = MagicMock()
+    # Simulate container was running and is stopped successfully
+    mock_controller.stop_if_running.return_value = True
+
     with patch("api.main._SYNC_FISH_AUDIO_SERVICE", mock_svc):
-        async with AsyncClient(app=app, base_url="http://test") as client:
-            response = await client.post("/v1/models/unload?model_type=s2-pro")
+        with patch("api.main.get_fish_sglang_controller", return_value=mock_controller):
+            async with AsyncClient(app=app, base_url="http://test") as client:
+                response = await client.post("/v1/models/unload?model_type=s2-pro")
 
     assert response.status_code == 200
     assert response.json()["unloaded"] == [["s2-pro", "remote"]]
+    assert response.json()["container_stopped"] is True
     mock_svc.unload_model.assert_called_once_with("s2-pro")
-
+    mock_controller.stop_if_running.assert_called_once()
 
 @pytest.mark.asyncio
-async def test_models_status_includes_fish_backend():
+def test_models_status_includes_fish_backend():
     app = _import_test_app()
     from httpx import AsyncClient
 

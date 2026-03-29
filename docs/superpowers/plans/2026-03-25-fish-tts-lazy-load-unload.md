@@ -71,6 +71,7 @@ docker>=7.0.0,<8
 
 ```python
 # tests/unit/test_fish_sglang_controller.py
+import pytest
 from unittest.mock import MagicMock, patch
 
 from inference.fish_sglang_controller import FishSGLangController
@@ -138,23 +139,75 @@ def test_ensure_running_raises_when_container_not_found():
 
 
 def test_controller_serializes_lifecycle_transitions():
+    """Verify that concurrent ensure_running and stop_if_running calls do not interleave."""
+    import threading
+
     with patch("inference.fish_sglang_controller.docker.from_env") as mock_from_env:
         docker_client = MagicMock()
         container = MagicMock()
         mock_from_env.return_value = docker_client
         docker_client.containers.get.return_value = container
 
-        container.status = "running"
+        call_log = []
+
+        original_start = container.start
+        original_stop = container.stop
+
+        def tracked_start(*args, **kwargs):
+            call_log.append("start")
+            return original_start(*args, **kwargs)
+
+        def tracked_stop(*args, **kwargs):
+            call_log.append("stop")
+            return original_stop(*args, **kwargs)
+
+        container.start.side_effect = tracked_start
+        container.stop.side_effect = tracked_stop
+
+        # First call: container is exited — should trigger start
+        container.status = "exited"
         container.attrs = {"State": {"Health": {"Status": "healthy"}}}
 
         controller = FishSGLangController(container_name="fish-sglang")
 
         controller.ensure_running()
+
+        # Second call: container now running — stop_if_running should trigger stop
+        container.status = "running"
         controller.stop_if_running()
 
-        # The implementation should guard start/stop transitions behind
-        # a controller-local lifecycle lock so the watcher and concurrent
-        # requests cannot race each other.
+        # Calls must appear in order with no interleaving
+        assert call_log == ["start", "stop"], f"Expected ['start', 'stop'], got {call_log}"
+
+        # Verify the lifecycle lock exists and is a threading.Lock-compatible type
+        assert hasattr(controller, "_lifecycle_lock")
+        assert hasattr(controller._lifecycle_lock, "acquire")
+
+        # Verify concurrent calls do not raise (lock is reentrant-safe for sequential callers)
+        errors = []
+
+        def run_ensure():
+            container.status = "running"
+            container.attrs = {"State": {"Health": {"Status": "healthy"}}}
+            try:
+                controller.ensure_running()
+            except Exception as e:
+                errors.append(e)
+
+        def run_stop():
+            container.status = "running"
+            try:
+                controller.stop_if_running()
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=run_ensure), threading.Thread(target=run_stop)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"Concurrent lifecycle calls raised: {errors}"
 ```
 
 - [ ] **Step 4: Implement controller**
@@ -185,13 +238,19 @@ class FishSGLangController:
         startup_timeout_seconds: int = 300,
         stop_timeout_seconds: int = 30,
         poll_interval_seconds: float = 2.0,
+        docker_socket_path: Optional[str] = None,
         docker_client: Optional[docker.DockerClient] = None,
     ) -> None:
         self._container_name = container_name
         self._startup_timeout_seconds = startup_timeout_seconds
         self._stop_timeout_seconds = stop_timeout_seconds
         self._poll_interval_seconds = poll_interval_seconds
-        self._docker = docker_client or docker.from_env()
+        if docker_client is not None:
+            self._docker = docker_client
+        elif docker_socket_path:
+            self._docker = docker.DockerClient(base_url=f"unix://{docker_socket_path}")
+        else:
+            self._docker = docker.from_env()
         self._lifecycle_lock = threading.Lock()
 
     def ensure_running(self) -> None:
@@ -280,6 +339,8 @@ git commit -m "feat: add fish-sglang container lifecycle controller"
 
 ## Chunk 2: Start Fish On First Request
 
+> **Pre-condition — single worker required:** The process-local state added in this chunk (`_FISH_REQUEST_COUNT`, `_FISH_SGLANG_CONTROLLER`) only works correctly when the API runs with a single Uvicorn worker. Multiple workers each have their own memory, so request counts and singleton state diverge across processes. The `--workers 1` enforcement is wired in Chunk 4, but if you test this chunk against a locally running server, ensure it is started with `--workers 1` or the in-flight counter will give false readings.
+
 ### Task 2: Ensure the sync Fish endpoint starts the container before calling the backend
 
 **Files:**
@@ -300,33 +361,51 @@ Read inference/fish_audio_service.py
 # tests/integration/test_fish_audio.py
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+import numpy as np
 
 
 @pytest.mark.asyncio
 async def test_s2_pro_sync_endpoint_ensures_container_running_before_generate():
+    """Verify the sync endpoint calls ensure_running before generate, both in one to_thread call."""
     from api.main import app
     from httpx import AsyncClient
 
     mock_controller = MagicMock()
     mock_service = MagicMock()
-    mock_service.generate.return_value = (MagicMock(__len__=lambda self: 48000), 24000)
+
+    # Simulate the blocking helper returning audio bytes + sample rate
+    fake_audio = np.zeros(48000, dtype=np.int16).tobytes()
+    fake_result = (fake_audio, 24000)
+
+    call_order = []
+
+    def blocking_helper():
+        # The implementation should call ensure_running then generate inside one thread
+        mock_controller.ensure_running()
+        call_order.append("ensure_running")
+        result = mock_service.generate(text="Hello world")
+        call_order.append("generate")
+        return result
+
+    mock_service.generate.return_value = fake_result
+
+    # Patch asyncio.to_thread so we can intercept the blocking helper and run it
+    async def fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
 
     with patch("api.main.get_fish_sglang_controller", return_value=mock_controller):
         with patch("api.main.get_sync_fish_audio_service", return_value=mock_service):
-            with patch("api.main.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
-                with patch("asyncio.get_event_loop") as mock_loop:
-                    loop = MagicMock()
-                    loop.run_in_executor = AsyncMock(return_value=(MagicMock(__len__=lambda self: 48000), 24000))
-                    mock_loop.return_value = loop
-                    mock_to_thread.return_value = None
-
-                    async with AsyncClient(app=app, base_url="http://test") as client:
-                        response = await client.post("/v1/tts/s2-pro/sync", json={"text": "Hello world"})
+            with patch("api.main.asyncio.to_thread", side_effect=fake_to_thread):
+                async with AsyncClient(app=app, base_url="http://test") as client:
+                    response = await client.post("/v1/tts/s2-pro/sync", json={"text": "Hello world"})
 
     assert response.status_code == 200
-    mock_to_thread.assert_called_once()
     mock_controller.ensure_running.assert_called_once()
+    # ensure_running must precede generate
+    assert call_order.index("ensure_running") < call_order.index("generate")
 ```
+
+> **Implementation note:** The test above reflects the consolidated single-`to_thread` approach recommended in Step 4. The endpoint should wrap both `controller.ensure_running()` and `svc.generate()` inside one blocking helper function passed to `asyncio.to_thread()`. Do not use `asyncio.get_event_loop().run_in_executor()` — that pattern is deprecated and must be removed as part of this chunk.
 
 - [ ] **Step 3: Add a singleton accessor for the controller**
 
@@ -343,12 +422,31 @@ def get_fish_sglang_controller() -> FishSGLangController:
         with _FISH_SGLANG_CONTROLLER_LOCK:
             if _FISH_SGLANG_CONTROLLER is None:
                 from inference.fish_sglang_controller import FishSGLangController
+                import docker as _docker
+                from docker.errors import DockerException as _DockerException
 
-                _FISH_SGLANG_CONTROLLER = FishSGLangController(
+                controller = FishSGLangController(
                     container_name=settings.fish_sglang_container_name,
                     startup_timeout_seconds=settings.fish_startup_timeout_seconds,
                     stop_timeout_seconds=settings.fish_stop_timeout_seconds,
+                    docker_socket_path=settings.fish_docker_socket_path,
                 )
+
+                # Probe Docker availability immediately so misconfiguration
+                # surfaces at first use rather than silently at request time.
+                try:
+                    controller._docker.ping()
+                    logger.info("Fish container controller: Docker API reachable")
+                except _DockerException as e:
+                    logger.error(
+                        "Fish container controller: Docker API unreachable — "
+                        "Fish lazy-start will fail until socket access is fixed",
+                        extra={"error": str(e)},
+                    )
+                    # Do not raise: allow the API to boot; the endpoint will return 503
+                    # when ensure_running() is called and the controller cannot reach Docker.
+
+                _FISH_SGLANG_CONTROLLER = controller
     return _FISH_SGLANG_CONTROLLER
 ```
 
@@ -364,38 +462,44 @@ svc = get_sync_fish_audio_service()
 
 If the endpoint is later refactored into a blocking helper, it is also acceptable to run the entire blocking startup-plus-generate segment in one worker thread. What must not happen is calling `controller.ensure_running()` directly on the event loop thread.
 
+> **Note:** The existing endpoint uses the deprecated `asyncio.get_event_loop().run_in_executor()`.
+> While this plan only adds `asyncio.to_thread(controller.ensure_running)`, consider consolidating
+> both the `ensure_running` call and the `svc.generate` call into a single `asyncio.to_thread()`
+> invocation (wrapping both in one blocking helper function). This avoids two thread-pool round
+> trips and removes the deprecated pattern in one step.
+
 Keep `FishAudioService` as an HTTP client. Do not make it spawn processes.
 
 - [ ] **Step 5: Add Fish in-flight request counter**
 
-Add a lightweight counter to track active Fish requests and prevent container stop during requests:
+Add a lightweight counter to track active Fish requests and prevent container stop during requests.
+Use a single lock for both the counter and the lifecycle-state decisions — a separate `_FISH_REQUEST_LOCK`
+is not needed and would create a second lock that must always be acquired in the same order:
 
 ```python
 import threading
 from typing import Optional
 
 _FISH_REQUEST_COUNT = 0
-_FISH_REQUEST_LOCK = threading.Lock()
 _FISH_LIFECYCLE_STATE_LOCK = threading.Lock()
 
 
 def _increment_fish_request_count() -> None:
     global _FISH_REQUEST_COUNT
     with _FISH_LIFECYCLE_STATE_LOCK:
-        with _FISH_REQUEST_LOCK:
-            _FISH_REQUEST_COUNT += 1
+        _FISH_REQUEST_COUNT += 1
 
 
 def _decrement_fish_request_count() -> None:
     global _FISH_REQUEST_COUNT
     with _FISH_LIFECYCLE_STATE_LOCK:
-        with _FISH_REQUEST_LOCK:
-            _FISH_REQUEST_COUNT -= 1
+        _FISH_REQUEST_COUNT -= 1
 
 
 def _is_fish_request_active() -> bool:
-    with _FISH_REQUEST_LOCK:
-        return _FISH_REQUEST_COUNT > 0
+    # Callers that need an atomic read+decision must already hold _FISH_LIFECYCLE_STATE_LOCK.
+    # This helper may also be called without the lock for logging-only purposes.
+    return _FISH_REQUEST_COUNT > 0
 ```
 
 Wrap the endpoint handler with try/finally to increment before and decrement after:
@@ -410,7 +514,10 @@ def _handle_fish_sync_request(...):
         _decrement_fish_request_count()
 ```
 
-The request counter alone is not enough. Use the shared lifecycle-state lock when making the decision that it is safe to unload/stop, so the watcher cannot observe `0` active requests at the same time a new request is beginning.
+The request counter alone is not enough. Use `_FISH_LIFECYCLE_STATE_LOCK` when making the decision
+that it is safe to unload/stop, so the watcher cannot observe `0` active requests at the same time
+a new request is beginning. Do not introduce a second lock for the counter — all reads and writes
+to `_FISH_REQUEST_COUNT` that affect lifecycle decisions must be guarded by `_FISH_LIFECYCLE_STATE_LOCK`.
 
 - [ ] **Step 6: Keep FishAudioService remote-wrapper semantics explicit**
 
@@ -468,7 +575,19 @@ git commit -m "feat: start fish-sglang on first sync request"
 
 ```bash
 Read api/main.py _run_fish_idle_watcher
+Read inference/fish_audio_service.py unload_idle_models
 ```
+
+> **Ordering note:** `_maybe_unload_idle_fish_backend` passes `fish_idle_unload_seconds` to the
+> service, but that setting is only added in Chunk 4. Implement Chunk 4 Step 1 (settings fields)
+> **before** wiring up this helper, or use `getattr(settings, "fish_idle_unload_seconds", 300)`
+> as a safe fallback until the setting is committed.
+>
+> **Settings clarification:** There are two separate idle timeout settings:
+> - `fish_idle_unload_seconds` (new) - controls Fish container stop after idle
+> - `tts_unload_idle_seconds` (existing) - controls Qwen model unload after idle
+>
+> These are intentionally separate because Fish and Qwen have different lifecycle managers (Docker container vs in-process model). Both the watcher and `FishAudioService.unload_idle_models()` should use `fish_idle_unload_seconds` for Fish-specific behavior.
 
 - [ ] **Step 2: Write failing test for idle stop**
 
@@ -517,6 +636,8 @@ def _maybe_unload_idle_fish_backend(idle_unload_seconds: int):
 ```
 
 Then make `_run_fish_idle_watcher()` call that helper.
+
+> **Lock scope warning:** `_FISH_LIFECYCLE_STATE_LOCK` is held across both `unload_idle_models()` and `controller.stop_if_running()`. This means any new incoming Fish request will stall on the lock until the watcher finishes. Verify that `FishAudioService.unload_idle_models()` is a cheap, non-blocking, in-memory operation with no I/O before shipping this shape. If it does any I/O (HTTP, disk), factor the lock into two phases: a locked read-then-clear of app-layer state, followed by an unlocked Docker stop call, accepting that a very tight race with a new request may result in starting an already-stopping container (which the `ensure_running()` path already handles by checking container status).
 
 Restart caveat: `_SYNC_FISH_AUDIO_SERVICE` only exists after this API process has handled at least one Fish request. Do not have the watcher stop a pre-existing running `fish-sglang` container after API restart unless you first add explicit reconciliation for last-activity state. Without that, the safe behavior is to leave the container alone until a new Fish request or a manual unload re-establishes ownership.
 
@@ -591,6 +712,13 @@ In `compose.yaml` for `echofleet-qwen3-tts`:
 - mount `/var/run/docker.sock:/var/run/docker.sock`
 - add env vars for the Fish lifecycle settings if you want explicit overrides
 - add an explicit socket access strategy for the non-root API process, preferably a supplementary group via `group_add` and a configurable host Docker GID
+- **Enforce single worker:** Add `--workers 1` to the API command override to ensure process-local request counting works correctly
+
+> **Docker socket verification:** Before deploying, verify the API container can access Docker by running this test inside the container:
+> ```bash
+> docker --version && docker ps
+> ```
+> If this fails, the socket permissions need adjustment before the Fish lifecycle features can work.
 
 In `Dockerfile` and/or Compose wiring:
 - preserve non-root execution for the API process
@@ -605,11 +733,12 @@ environment:
   - FISH_STARTUP_TIMEOUT_SECONDS=300
   - FISH_STOP_TIMEOUT_SECONDS=30
   - FISH_SGLANG_CONTAINER_NAME=fish-sglang
-    - HOST_DOCKER_GID=${HOST_DOCKER_GID:-999}
+  - HOST_DOCKER_GID=${HOST_DOCKER_GID:-999}
 group_add:
-    - "${HOST_DOCKER_GID:-999}"
+  - "${HOST_DOCKER_GID:-999}"
 volumes:
   - /var/run/docker.sock:/var/run/docker.sock
+command: ["python", "-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
 ```
 
 If the deployment environment cannot guarantee correct socket permissions for the non-root API user, stop here and choose the supervisor-service alternative instead of shipping a half-working Docker-socket design.
@@ -629,7 +758,15 @@ The API must be able to boot while Fish is stopped.
 
 Do not remove the `fish-sglang` service definition. The controller will start and stop that existing named container.
 
-- [ ] **Step 5: Update model status to include container lifecycle state**
+- [ ] **Step 5: Verify fish-sglang container definition exists**
+
+Before deploying, verify the `fish-sglang` service is defined in `compose.yaml`:
+```bash
+docker compose config --services | grep fish-sglang
+```
+If missing, the controller cannot manage a non-existent container. The service definition must remain.
+
+- [ ] **Step 6: Update model status to include container lifecycle state**
 
 Extend `/v1/models/status` in `api/main.py` so it reports both:
 - the existing app-layer Fish wrapper state
@@ -639,13 +776,13 @@ This avoids ambiguity after API restarts, where the wrapper may be uninitialized
 
 Add an integration test that verifies the status payload includes a Fish container section when the controller is available.
 
-- [ ] **Step 6: Run config sanity checks**
+- [ ] **Step 7: Run config sanity checks**
 
 ```bash
 pytest tests/integration/test_fish_audio.py -v
 ```
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add api/main.py config/settings.py compose.yaml Dockerfile tests/integration/test_fish_audio.py
@@ -734,6 +871,8 @@ git commit -m "feat: stop fish-sglang on manual or idle unload"
 - [ ] Tests reflect the real architecture: remote Fish client plus Docker-managed container lifecycle.
 - [ ] `/v1/models/status` distinguishes app-layer Fish state from container-level Fish state.
 - [ ] The restart behavior is explicit: after API restart, an already-running `fish-sglang` container is not treated as idle unless the implementation adds explicit reconciliation beyond process-local state.
+- [ ] The API runs with a single Uvicorn worker (`--workers 1`) as enforced in `compose.yaml`.
+- [ ] Docker socket is verified accessible from the API container before deployment.
 
 ---
 
@@ -745,7 +884,8 @@ git commit -m "feat: stop fish-sglang on manual or idle unload"
 - This plan intentionally does not stop a `fish-sglang` container that predates the current API process unless ownership/last-activity reconciliation is added explicitly.
 - If Docker socket access is rejected, create a narrow supervisor service that exposes `start fish`, `stop fish`, and `status fish` endpoints, then swap the controller to call that service instead of Docker directly.
 - The in-flight request counter by itself is insufficient. Use a shared lifecycle-state lock for request begin/end bookkeeping and unload decisions, and a controller-local lock for Docker start/stop transitions.
-- The in-flight request counter uses process-local threading state. Ensure the FastAPI worker configuration (e.g., `--workers 1` or async-only) is compatible with this concurrency model. If running multiple workers, consider using Redis or another shared coordination primitive for the request count.
+- The in-flight request counter uses process-local threading state. **REQUIRED:** The API must run with a single Uvicorn worker (`--workers 1`). This is enforced in `compose.yaml` via the command override. If multiple workers are needed, replace the process-local counter with Redis-backed counting using the existing Redis connection.
+- The idle watcher runs as a daemon thread. Consider adding a `/v1/health` endpoint that checks the watcher thread is alive and logs a warning if it has exited unexpectedly.
 
 ---
 
@@ -775,3 +915,9 @@ git commit -m "feat: stop fish-sglang on manual or idle unload"
 ### Docker socket permission denied
 - **Symptom:** `PermissionError: [Errno 13] /var/run/docker.sock`
 - **Fix:** Ensure API container runs with appropriate group or UID that has Docker socket access
+
+### Idle watcher not running
+- **Symptom:** Fish container never stops after idle timeout
+- **Check:** Verify `_run_fish_idle_watcher` thread was started at API boot (check logs for "Starting Fish idle watcher")
+- **Check:** Verify `FISH_IDLE_UNLOAD_SECONDS` is set > 0
+- **Check:** Verify API is running with single worker (`--workers 1`)

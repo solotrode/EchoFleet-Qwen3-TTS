@@ -138,10 +138,10 @@ class WhisperTranscriberHF:
                 extra={"audio_path": audio_path, "model_id": self._model_id},
             )
             raise RuntimeError(f"Whisper transcription failed: {exc}") from exc
-    
+
     def unload(self) -> None:
         """Unload Whisper model and free GPU memory.
-        
+
         Performs aggressive cleanup to ensure GPU memory is released:
         - Deletes ASR pipeline
         - Runs garbage collection multiple times
@@ -149,18 +149,17 @@ class WhisperTranscriberHF:
         - Synchronizes CUDA device
         """
         import gc
-        
+
         logger.info(
-            "Unloading Whisper model",
-            extra={"model_id": self._model_id, "device": self._device}
+            "Unloading Whisper model", extra={"model_id": self._model_id, "device": self._device}
         )
-        
+
         # Delete the ASR pipeline
         try:
             del self._asr
         except Exception as e:
             logger.warning(f"Failed to delete ASR pipeline: {e}")
-        
+
         # Synchronize CUDA if on GPU
         if self._device != "cpu" and torch.cuda.is_available():
             try:
@@ -169,11 +168,11 @@ class WhisperTranscriberHF:
                     torch.cuda.synchronize(device_idx)
             except Exception as e:
                 logger.warning(f"CUDA synchronize failed: {e}")
-        
+
         # Multiple rounds of garbage collection
         for _ in range(5):
             gc.collect()
-        
+
         # Empty CUDA cache multiple times if on GPU
         if self._device != "cpu" and torch.cuda.is_available():
             device_idx = self._device_index(self._device)
@@ -185,8 +184,7 @@ class WhisperTranscriberHF:
                             gc.collect()
                 except Exception as e:
                     logger.warning(f"CUDA empty_cache failed for {self._device}: {e}")
-        
+
         logger.info(
-            "Whisper model unloaded",
-            extra={"model_id": self._model_id, "device": self._device}
+            "Whisper model unloaded", extra={"model_id": self._model_id, "device": self._device}
         )

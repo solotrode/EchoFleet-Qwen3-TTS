@@ -2,14 +2,17 @@ import base64
 import io
 import json
 import sys
+
 import numpy as np
-import soundfile as sf
 import requests
+import soundfile as sf
+
 try:
     from utils.logging import get_logger
 except Exception:
     # If script is executed directly, ensure repo root is on sys.path
     import pathlib
+
     repo_root = str(pathlib.Path(__file__).resolve().parents[1])
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
@@ -37,17 +40,19 @@ payload = {
     # Use a model-expected language label to bypass mapping issues.
     "language": "english",
     "x_vector_only_mode": False,
-    "output_format": "wav"
+    "output_format": "wav",
 }
 
 try:
     resp = requests.post(API_URL, json=payload, timeout=120)
     logger.info("smoke_test: response", extra={"status_code": resp.status_code})
-    if resp.headers.get('content-type','').startswith('application/json'):
+    if resp.headers.get("content-type", "").startswith("application/json"):
         data = resp.json()
         logger.info("smoke_test: json keys", extra={"keys": list(data.keys())})
-        if 'audio_base64' in data:
-            logger.info("smoke_test: audio size", extra={"audio_base64_len": len(data['audio_base64'])})
+        if "audio_base64" in data:
+            logger.info(
+                "smoke_test: audio size", extra={"audio_base64_len": len(data["audio_base64"])}
+            )
     else:
         logger.warning("smoke_test: non-json response", extra={"length": len(resp.content)})
     logger.debug(resp.text[:400])

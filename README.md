@@ -38,7 +38,35 @@ What is scaffolded / planned (not fully implemented yet):
 
 ---
 
-## Runbooks
+## Fish S2 Pro Container Lazy Start/Stop (Fish TTS Docker Lifecycle)
+
+The Fish S2 Pro TTS backend is provisioned as a separate Docker container (`fish-sglang`) and is managed by the main API container to conserve GPU VRAM and system resources. By default, **the Fish container is NOT running** until the first S2 Pro TTS request is received.
+
+**How lazy start/stop works**:
+- When a Fish TTS request is made to `/v1/tts/s2-pro/sync`, the API attempts to start the `fish-sglang` Docker container (if not already running).
+- The controller waits for the container and health check to turn `healthy` before proceeding.
+- If no Fish requests are received for the configured idle period (default: 300 seconds), the container is automatically stopped to free VRAM and host resources.
+- **Manual unload:** Whenever the Fish S2 Pro model is explicitly unloaded via `/v1/models/unload?model_type=s2-pro`, the API will also stop the Fish container.
+
+**Key configuration variables (see compose.yaml, settings.py):**
+- `FISH_IDLE_UNLOAD_SECONDS`: Idle duration before fish-sglang container is auto-stopped (default: 300)
+- `FISH_STARTUP_TIMEOUT_SECONDS`: How long to wait for startup/health (default: 300)
+- `FISH_STOP_TIMEOUT_SECONDS`: Timeout for graceful stop (default: 30)
+- `FISH_SGLANG_CONTAINER_NAME`: Name of the container (default: fish-sglang)
+- `FISH_DOCKER_SOCKET_PATH`: Path to the Docker socket (default: /var/run/docker.sock)
+- `HOST_DOCKER_GID`: Group to access Docker socket; must match host Docker group
+
+**Operational Notes / Troubleshooting:**
+- The API container mounts the Docker socket and must run with a group matching the Docker host for socket access; otherwise, startup or stop will fail (see `group_add` in compose.yaml).
+- `GET /v1/models/status` shows the health and state of the Fish service **and** its container.
+- Container lifecycle actions are logged with detail in `/logs/echofleet-qwen3-tts.jsonl`.
+
+**Examples:**
+- Force unload and stop: `curl -X POST http://localhost:18000/v1/models/unload?model_type=s2-pro`
+- Check container status: `curl http://localhost:18000/v1/models/status` (see `fish_container_state`)
+- If the Fish S2 Pro backend fails to start due to Docker permissions, check your user/groups and Docker Desktop/Engine config.
+
+---
 
 - GPU inference stability (tokenizer-on-CPU regression): [docs/GPU_INFERENCE_RUNBOOK.md](docs/GPU_INFERENCE_RUNBOOK.md)
 - Model unloading via API (free VRAM on demand): [docs/MODEL_UNLOAD.md](docs/MODEL_UNLOAD.md)

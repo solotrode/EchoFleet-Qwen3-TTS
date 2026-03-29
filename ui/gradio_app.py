@@ -8,19 +8,20 @@ process) and avoids running multiple servers in a single container.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
-import io
-import urllib.error
-import urllib.request
-from utils.logging import get_logger
 import socket
 import time
+import urllib.error
+import urllib.request
 from typing import Any, Dict, Optional, Tuple
 
 import gradio as gr
 import numpy as np
 import soundfile as sf
+
+from utils.logging import get_logger
 
 
 def _api_base_url() -> str:
@@ -86,8 +87,12 @@ def voice_clone(
         ref_audio = ref_audio_url.strip()
     # If user pasted a very long data URL or base64, refuse client-side
     try:
-        if isinstance(ref_audio, str) and (ref_audio.startswith("data:") or ("base64" in ref_audio and len(ref_audio) > 1024)):
-            raise ValueError("Ref audio appears to be a large data URL; please upload a file instead (or shorten the data).")
+        if isinstance(ref_audio, str) and (
+            ref_audio.startswith("data:") or ("base64" in ref_audio and len(ref_audio) > 1024)
+        ):
+            raise ValueError(
+                "Ref audio appears to be a large data URL; please upload a file instead (or shorten the data)."
+            )
     except Exception:
         pass
 
@@ -232,7 +237,14 @@ def build_ui() -> gr.Blocks:
             out_meta = gr.Textbox(label="Info")
             btn.click(
                 voice_clone,
-                inputs=[text, language, ref_audio_file, ref_audio_url, ref_text, x_vector_only_mode],
+                inputs=[
+                    text,
+                    language,
+                    ref_audio_file,
+                    ref_audio_url,
+                    ref_text,
+                    x_vector_only_mode,
+                ],
                 outputs=[out_audio, out_meta],
             )
 
@@ -258,7 +270,11 @@ def build_ui() -> gr.Blocks:
             btn = gr.Button("Generate")
             out_audio = gr.Audio(label="Output", type="numpy")
             out_meta = gr.Textbox(label="Info")
-            btn.click(custom_voice, inputs=[text, language, speaker, instruct], outputs=[out_audio, out_meta])
+            btn.click(
+                custom_voice,
+                inputs=[text, language, speaker, instruct],
+                outputs=[out_audio, out_meta],
+            )
 
         with gr.Tab("Voice Design"):
             text = gr.Textbox(label="Text", lines=3)
@@ -271,7 +287,9 @@ def build_ui() -> gr.Blocks:
             btn = gr.Button("Generate")
             out_audio = gr.Audio(label="Output", type="numpy")
             out_meta = gr.Textbox(label="Info")
-            btn.click(voice_design, inputs=[text, language, instruct], outputs=[out_audio, out_meta])
+            btn.click(
+                voice_design, inputs=[text, language, instruct], outputs=[out_audio, out_meta]
+            )
 
     return demo
 

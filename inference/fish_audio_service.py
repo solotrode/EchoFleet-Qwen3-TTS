@@ -7,10 +7,13 @@ Unlike Qwen, the actual GPU-resident model lives in the remote SGLang process.
 This wrapper mirrors the same lazy-load and unload contract at the application
 layer so the API can treat both backends consistently.
 """
-from typing import Any, Optional, Tuple
+
+from __future__ import annotations
+
 import os
 import threading
 import time
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import requests
@@ -161,7 +164,7 @@ class FishAudioService:
     def unload_idle_models(self, idle_seconds: Optional[int] = None) -> list[Tuple[str, str]]:
         """Unload the Fish backend handle after a period of inactivity."""
         if idle_seconds is None:
-            idle_seconds = int(getattr(self._settings, "tts_unload_idle_seconds", 300))
+            idle_seconds = self._settings.fish_idle_unload_seconds
 
         with self._lock:
             if not self._loaded:

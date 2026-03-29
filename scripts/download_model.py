@@ -12,12 +12,14 @@ This script uses `huggingface_hub.snapshot_download` to produce a local folder
 that matches the repository layout, suitable for use as a model cache directory
 inside the container (`/models/<repo-id>`).
 """
+
 from __future__ import annotations
 
 import argparse
 import os
 import sys
 from typing import Optional
+
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -25,17 +27,28 @@ logger = get_logger(__name__)
 try:
     from huggingface_hub import snapshot_download
 except Exception as e:  # pragma: no cover - runtime import error
-    logger.error("Missing dependency: huggingface_hub. Install with 'pip install huggingface-hub'", extra={"error": str(e)})
+    logger.error(
+        "Missing dependency: huggingface_hub. Install with 'pip install huggingface-hub'",
+        extra={"error": str(e)},
+    )
     raise
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Download HF repo to ./models/<repo>")
-    p.add_argument("--repo", required=False, help="Hugging Face repo id (e.g. Qwen/Qwen3-TTS-12Hz-1.7B-Base)")
+    p.add_argument(
+        "--repo", required=False, help="Hugging Face repo id (e.g. Qwen/Qwen3-TTS-12Hz-1.7B-Base)"
+    )
     p.add_argument("--out", default="models", help="Output base folder (default: models)")
-    p.add_argument("--file", default=None, help="Path to file with one repo id per line (batch mode)")
+    p.add_argument(
+        "--file", default=None, help="Path to file with one repo id per line (batch mode)"
+    )
     p.add_argument("--revision", default=None, help="Repo revision/commit/tag to download")
-    p.add_argument("--token", default=os.environ.get("HUGGINGFACE_HUB_TOKEN"), help="Hugging Face token (or set HUGGINGFACE_HUB_TOKEN)")
+    p.add_argument(
+        "--token",
+        default=os.environ.get("HUGGINGFACE_HUB_TOKEN"),
+        help="Hugging Face token (or set HUGGINGFACE_HUB_TOKEN)",
+    )
     return p.parse_args()
 
 

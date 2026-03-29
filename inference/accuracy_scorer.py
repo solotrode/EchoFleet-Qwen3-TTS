@@ -3,16 +3,18 @@ Accuracy scoring utilities for candidate generation.
 
 Provides normalization (via whisper-normalizer) and WER/CER scoring (via jiwer).
 """
+
 from __future__ import annotations
 
-from typing import Dict, Any
 import logging
+from typing import Any, Dict
 
-from jiwer import wer, cer
+from jiwer import cer, wer
 
 # Try to import whisper-normalizer robustly; API changed between versions.
 try:
     from whisper_normalizer import BasicTextNormalizer  # preferred
+
     _normalizer = BasicTextNormalizer()
 except Exception:
     try:
@@ -61,7 +63,9 @@ class AccuracyScorer:
     and normalized strings for debugging.
     """
 
-    def score_candidate(self, reference: str, transcription: str, duration: float) -> Dict[str, Any]:
+    def score_candidate(
+        self, reference: str, transcription: str, duration: float
+    ) -> Dict[str, Any]:
         ref_clean = normalize_text(reference or "")
         trans_clean = normalize_text(transcription or "")
 

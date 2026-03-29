@@ -1945,8 +1945,17 @@ async def unload_models(model_type: Optional[str] = None):
             if svc is not None:
                 fish_unloaded = svc.unload_model("s2-pro")
 
+            # Also stop the Fish container if controller available
+            controller = get_fish_sglang_controller()
+            fish_container_stopped = None
+            if controller is not None:
+                try:
+                    fish_container_stopped = controller.stop_if_running()
+                except Exception as e:
+                    logger.error("Failed to stop Fish container after model unload", extra={"error": str(e)})
             if model_type == "s2-pro":
-                return {"status": "ok", "unloaded": fish_unloaded}
+                return {"status": "ok", "unloaded": fish_unloaded, "container_stopped": fish_container_stopped}
+
 
         # Send unload command to worker via Redis
         cmd_id = uuid.uuid4().hex
