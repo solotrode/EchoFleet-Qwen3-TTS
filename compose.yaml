@@ -163,8 +163,25 @@ services:
       - echofleet-qwen3-network
 
   # ============================================================================
+  # Fish Audio SGLang Base Image Builder
+  # Only used to build fish-sglang-base:local (the heavy apt+pip install layer).
+  # Never starts as a running container — profile-gated so it's opt-in only.
+  #
+  # Rebuild when SGLANG_OMNI_REF changes:
+  #   docker compose --profile build-base build fish-sglang-base
+  # ============================================================================
+  fish-sglang-base:
+    image: fish-sglang-base:local
+    build:
+      context: .
+      dockerfile: Dockerfile.sglang-base
+    profiles:
+      - build-base
+
+  # ============================================================================
   # Fish Audio SGLang Server (S2 Pro TTS + Voice Cloning)
-  # Build from source: https://github.com/sgl-project/sglang-omni
+  # Builds FROM fish-sglang-base:local — only the runtime patches layer rebuilds.
+  # Normal rebuild: docker compose up --build fish-sglang
   # ============================================================================
   fish-sglang:
     image: fish-sglang:local

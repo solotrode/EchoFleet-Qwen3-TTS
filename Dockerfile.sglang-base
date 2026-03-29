@@ -1,0 +1,97 @@
+# syntax=docker/dockerfile:1
+# Fish Audio SGLang — Base Image
+#
+# Contains the heavy install (apt + Python + sglang-omni pip install).
+# Only rebuild when SGLANG_OMNI_REF changes:
+#
+#   docker compose --profile build-base build fish-sglang-base
+#
+# Runtime patches live in Dockerfile.sglang and are rebuilt by normal
+# `docker compose up --build fish-sglang`.
+
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+ARG SGLANG_OMNI_REF=2f25198f926e289e0f90c1d3d4aad0cd515255a7  # Pinned to specific commit for reproducibility
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    git \
+    curl \
+    ca-certificates \
+    libnuma1 \
+    libibverbs1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py && \
+    python3.12 /tmp/get-pip.py && \
+    rm /tmp/get-pip.py && \
+    rm -rf /var/lib/apt/lists/*
+
+# Clone and install sglang-omni.
+# The uv cache mount survives across rebuilds so packages aren't re-downloaded
+# when only SGLANG_OMNI_REF changes.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    git clone https://github.com/sgl-project/sglang-omni.git /app/sglang-omni && \
+    cd /app/sglang-omni && \
+    git checkout ${SGLANG_OMNI_REF} && \
+    python3.12 -m pip install --no-cache-dir --upgrade pip uv && \
+    uv venv ${VIRTUAL_ENV} -p python3.12 && \
+    uv pip install -v ".[s2pro]"
+
+# Copy fish_speech configs from source repo into site-packages
+RUN python - <<'PY'
+from pathlib import Path
+import shutil
+
+source_configs = Path('/app/sglang-omni/sglang_omni/models/fishaudio_s2_pro/fish_speech/configs')
+target_configs = Path('/opt/venv/lib/python3.12/site-packages/sglang_omni/models/fishaudio_s2_pro/fish_speech/configs')
+target_configs.parent.mkdir(parents=True, exist_ok=True)
+if target_configs.exists():
+    shutil.rmtree(target_configs)
+shutil.copytree(source_configs, target_configs)
+PY
+
+# Bootstrap custom model registration via sitecustomize.py
+RUN python - <<'PY'
+from pathlib import Path
+
+sitecustomize = Path('/opt/venv/lib/python3.12/site-packages/sitecustomize.py')
+sitecustomize.write_text(
+    '"""Bootstrap custom model registration for sglang-omni."""\n'
+    'try:\n'
+    '    import sglang_omni.models.fishaudio_s2_pro.fish_speech.models.text2semantic.modeling\n'
+    'except Exception:\n'
+    '    pass\n',
+    encoding='utf-8',
+)
+PY
+
+# Create the start-sglang-s2pro launcher
+RUN python - <<'PY'
+from pathlib import Path
+
+launcher = Path('/usr/local/bin/start-sglang-s2pro')
+launcher.write_text(
+    '#!/opt/venv/bin/python\n'
+    'import runpy\n'
+    'import sys\n'
+    'import sglang_omni.models.fishaudio_s2_pro.fish_speech.models.text2semantic\n'
+    'sys.argv = ["sglang_omni", *sys.argv[1:]]\n'
+    'runpy.run_module("sglang_omni.cli.cli", run_name="__main__")\n',
+    encoding='utf-8',
+)
+launcher.chmod(0o755)
+PY
+
+WORKDIR /app/sglang-omni

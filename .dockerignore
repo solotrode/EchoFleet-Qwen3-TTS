@@ -23,6 +23,7 @@ venv/
 ARCHIVE/
 logs/
 outputs/
+.worktrees/
 
 # Only bake the actual model payloads under models/Qwen.
 # The other cache directories (models/hub, models/transformers, models/xet, etc.)
